@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.eggs/
+
+# Dados locais gerados em runtime (nunca versionar)
+.local/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+
+# Exportacoes, uploads e caches
+exports/
+uploads/
+.cache/
+
+# IDE / SO
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Segredos (defensivo; nao devem existir neste projeto)
+.env
+.env.*
+credentials.json
+*.key
+*.pem
+
+# Assets nada haver com o app
+out/
+build/
+dist/
+
+
+# Documentos diversos
+_plan.md
+_plan_opus.md
+logs.txt
+.claude

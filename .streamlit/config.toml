@@ -1,0 +1,24 @@
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+
+[server]
+port = 8501
+
+[runner]
+magicEnabled = false
+
+[theme]
+primaryColor = "#2F6FED"
+
+[theme.light]
+primaryColor = "#2F6FED"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F3F6"
+textColor = "#2E3338"
+
+[theme.dark]
+primaryColor = "#2F6FED"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#171B22"
+textColor = "#D5D8DC"

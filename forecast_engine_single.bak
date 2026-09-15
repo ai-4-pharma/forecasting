@@ -1,0 +1,3214 @@
+"""Forecast Community - motor de previsao: candidatos, validacao temporal,
+metricas, selecao, previsao final, intervalos, premissas e hierarquia.
+
+Este modulo nao conhece Streamlit nem escreve no DuckDB. Recebe dados e
+configuracoes (RunInputs) e devolve eventos (gerador) ou frames puros.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+import numpy as np
+import polars as pl
+
+from contracts import (
+    DEFAULT_INTERVAL_LEVEL,
+    DEFAULT_SEED,
+    EffectType,
+    ForecastBatch,
+    ForecastConfig,
+    HierarchyConfig,
+    HierarchyMode,
+    ModelSpec,
+    PredictionStatus,
+    RunEvent,
+    RunInputs,
+    RunStage,
+    ScenarioConfig,
+    SelectionReason,
+    SelectionResult,
+    SourceFrequency,
+    CVWindow,
+    AssumptionRule,
+    RegressorSpec,
+    ValidationIssue,
+    Severity,
+    IntervalMethod,
+    ERR_SCENARIO_PRIORITY_TIE,
+    ERR_SCENARIO_REG_FAMILY_DUP,
+    ERR_SCENARIO_PARTIAL_NODE,
+    ERR_REGRESSOR_COLLINEAR,
+    ERR_REGRESSOR_UNAVAILABLE_AT_CUTOFF,
+    INT_MIN_HISTORY_REGULAR,
+    MAX_REGRESSORS_PER_RUN,
+    RegressorFillPolicy,
+    MIN_CV_FIRST_TRAIN,
+    MIN_INTERMITTENT_PERIODS,
+    MIN_INTERMITTENT_POSITIVES,
+    TIE_TOLERANCE,
+    stable_id,
+)
+
+# ---------------------------------------------------------------------------
+# Registro de candidatos (P15)
+# ---------------------------------------------------------------------------
+
+MODEL_ORDER = [
+    "ZeroBaseline",
+    "Naive",
+    "MediaMovel3",
+    "MediaMovel6",
+    "MediaMovel12",
+    "HistoricAverage",
+    "SeasonalNaive",
+    "RegLinearDrift",
+    "Holt",
+    "HoltDamped",
+    "AutoETS",
+    "ETS_Damped",
+    "AutoARIMA",
+    "AutoARIMA_X",
+    "AutoTheta",
+    "AutoCES",
+    "AutoTBATS",
+    "CrostonSBA",
+    "TSB",
+    "LightGBM",
+    "XGBoost",
+]
+RANK_BY_ALIAS = {name: i for i, name in enumerate(MODEL_ORDER)}
+
+MODEL_LABELS_PT = {
+    "ZeroBaseline": "Zero (série zerada)",
+    "Naive": "Último valor (Naive)",
+    "MediaMovel3": "Média móvel 3M",
+    "MediaMovel6": "Média móvel 6M",
+    "MediaMovel12": "Média móvel 12M",
+    "HistoricAverage": "Média histórica",
+    "SeasonalNaive": "Sazonal Naive (mesmo mês ano anterior)",
+    "RegLinearDrift": "Regressão / tendência linear (Drift)",
+    "Holt": "Suavização Holt (tendência)",
+    "HoltDamped": "Suavização Holt amortecida",
+    "AutoETS": "Suavização Exponencial (ETS automático)",
+    "ETS_Damped": "Suavização Exponencial amortecida (ETS-D)",
+    "AutoARIMA": "ARIMA/SARIMA automático",
+    "AutoARIMA_X": "ARIMA com regressoras (ARIMAX)",
+    "AutoTheta": "Theta (decomposição)",
+    "AutoCES": "Suavização Complexa (CES)",
+    "AutoTBATS": "TBATS (sazonalidade complexa)",
+    "CrostonSBA": "Demanda intermitente (Croston-SBA)",
+    "TSB": "Demanda intermitente (TSB)",
+    "LightGBM": "ML Global (LightGBM)",
+    "XGBoost": "ML Global (XGBoost)",
+}
+
+
+def model_label(alias: str) -> str:
+    return MODEL_LABELS_PT.get(alias, alias)
+
+
+def _make_spec(alias: str, **kw) -> ModelSpec:
+    base = {
+        "alias": alias,
+        "params": {},
+        "supports_regressors": False,
+        "supports_intervals": False,
+        "min_train": 3,
+        "min_seasonal_cycles": 2,
+        "intermittent": False,
+        "requires_positives": False,
+        "baseline": False,
+        "global_model": False,
+        "need_ml": False,
+        "rank": RANK_BY_ALIAS.get(alias, 100),
+    }
+    base.update(kw)
+    return ModelSpec(**base)
+
+
+def build_candidates(profile, study, config: ForecastConfig) -> list[ModelSpec]:
+    """Constrói lista de ModelSpec conforme o perfil/modo + seleção do usuário.
+
+    Se `config.candidate_aliases` estiver preenchido (seletor da UI), apenas
+    esses aliases concorrem — modo comparador, sem decisão automática oculta.
+    """
+    interval_req = config.interval_level if config.interval_level else None
+    candidates: list[ModelSpec] = []
+    wanted = set(getattr(config, "candidate_aliases", []) or [])
+
+    def add(alias: str, **kw) -> None:
+        if wanted and alias not in wanted:
+            return
+        s = _make_spec(alias, **kw)
+        candidates.append(s)
+
+    add("Naive", baseline=True, min_train=1)
+    add("MediaMovel3", baseline=True, min_train=3, params={"window": 3})
+    add("MediaMovel6", baseline=True, min_train=6, params={"window": 6})
+    add("MediaMovel12", baseline=True, min_train=12, params={"window": 12})
+    add("HistoricAverage", baseline=True, min_train=3)
+    if interval_req:
+        candidates[-1].supports_intervals = True
+
+    if study.source_frequency in (SourceFrequency.MONTHLY, SourceFrequency.QUARTERLY):
+        add("SeasonalNaive", baseline=True, min_train=8, min_seasonal_cycles=2)
+
+    add("RegLinearDrift", baseline=True, min_train=4)
+    add("Holt", min_train=8, supports_intervals=True)
+    add("HoltDamped", min_train=8, supports_intervals=True)
+
+    if config.mode == config.mode.ADVANCED:
+        add("AutoCES", min_train=8, supports_intervals=True)
+        add("AutoARIMA", min_train=8, supports_intervals=True)
+        add("AutoTBATS", min_train=24, supports_intervals=False)
+
+    if config and config.regressor_ids:
+        add(
+            "AutoARIMA_X",
+            min_train=8,
+            supports_intervals=True,
+            supports_regressors=True,
+        )
+
+    add("AutoETS", min_train=8, supports_intervals=True)
+    add("ETS_Damped", min_train=8, supports_intervals=True)
+    add("AutoTheta", min_train=8, supports_intervals=True)
+    add(
+        "CrostonSBA",
+        intermittent=True,
+        min_train=MIN_INTERMITTENT_PERIODS,
+        requires_positives=True,
+        min_seasonal_cycles=1,
+    )
+    add(
+        "TSB",
+        intermittent=True,
+        min_train=MIN_INTERMITTENT_PERIODS,
+        requires_positives=True,
+        min_seasonal_cycles=1,
+        params={"alpha_d": 0.2, "alpha_p": 0.2},
+    )
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Janelas CV (P16)
+# ---------------------------------------------------------------------------
+
+
+def _freq_str(freq: SourceFrequency) -> str:
+    """Strings de frequência aceitas pelo StatsForecast 2.x (offset polars)."""
+    if freq in (SourceFrequency.MONTHLY, SourceFrequency.MAT):
+        return "1mo"
+    if freq == SourceFrequency.QUARTERLY:
+        return "3mo"
+    return "1y"
+
+
+def _pd_freq_str(freq: SourceFrequency) -> str:
+    """Strings de frequência para MLForecast (pandas)."""
+    if freq in (SourceFrequency.MONTHLY, SourceFrequency.MAT):
+        return "MS"
+    if freq == SourceFrequency.QUARTERLY:
+        return "QS"
+    return "YS"
+
+
+def _season_length(freq: SourceFrequency) -> int:
+    """Comprimento do ciclo sazonal por frequência (doc 5.3)."""
+    if freq in (SourceFrequency.MONTHLY, SourceFrequency.MAT):
+        return 12
+    if freq == SourceFrequency.QUARTERLY:
+        return 4
+    return 1
+
+
+def _freq_from_windows(
+    windows: list[CVWindow], default: SourceFrequency = SourceFrequency.MONTHLY
+) -> SourceFrequency:
+    """Inferência da frequência de modelagem a partir das janelas de CV."""
+    if not windows or len(windows[0].eval_dates) < 2:
+        return default
+    d1, d2 = windows[0].eval_dates[0], windows[0].eval_dates[1]
+    months = (d2.year - d1.year) * 12 + (d2.month - d1.month)
+    if months == 3:
+        return SourceFrequency.QUARTERLY
+    if months == 12:
+        return SourceFrequency.YEARLY
+    return default
+
+
+def _add_period(d: dt.date, freq: SourceFrequency, k: int) -> dt.date:
+    if freq in (SourceFrequency.MONTHLY, SourceFrequency.MAT):
+        idx = d.year * 12 + (d.month - 1) + k
+        return dt.date(idx // 12, idx % 12 + 1, 1)
+    if freq == SourceFrequency.QUARTERLY:
+        q = (d.month - 1) // 3
+        idx = d.year * 4 + q + k
+        return dt.date(idx // 4, (idx % 4) * 3 + 1, 1)
+    return dt.date(d.year + k, 1, 1)
+
+
+def build_cv_windows(data, study, config: ForecastConfig) -> list[CVWindow]:
+    """Corta séries de forma temporal (treino expansivo, testes não sobrepostos)."""
+    h = config.cv_horizon or _default_cv_horizon(study, config.horizon_periods)
+    if isinstance(data, pl.DataFrame):
+        dates = sorted(set(data["ds"].to_list()))
+    else:
+        dates = sorted(set(data))
+    if not dates:
+        return []
+    n = len(dates)
+    # maior K <= cv_windows com primeiro treino com pelo menos 3 observações
+    k = 0
+    for candidate_k in range(min(config.cv_windows, n // h), 0, -1):
+        first_cutoff_idx = (
+            n - candidate_k * h
+        )  # índice da 1ª observação do teste do fold 0
+        if first_cutoff_idx >= 3:
+            k = candidate_k
+            break
+    if k < MIN_CV_FIRST_TRAIN and n // h < MIN_CV_FIRST_TRAIN:
+        k = max(1, k) if n > h + 3 else 0
+    if k == 0:
+        return []
+    out: list[CVWindow] = []
+    for j in range(k):
+        # fold j: treino até o índice (n - (k-j)*h + 1) - 1 => corte em n-(k-j)*h
+        test_start_idx = n - (k - j) * h
+        if test_start_idx <= 0:
+            continue
+        cutoff = dates[test_start_idx - 1]
+        test_start = _add_period(cutoff, study.model_frequency, 1)
+        test_end = _add_period(cutoff, study.model_frequency, h)
+        eval_dates = [
+            _add_period(cutoff, study.model_frequency, i) for i in range(1, h + 1)
+        ]
+        out.append(
+            CVWindow(
+                cutoff=cutoff,
+                train_start=dates[0],
+                train_end=cutoff,
+                test_start=test_start,
+                test_end=test_end,
+                eval_dates=eval_dates,
+            )
+        )
+    return out
+
+
+def _default_cv_horizon(study, horizon: int) -> int:
+    f = study.model_frequency
+    if f == SourceFrequency.YEARLY:
+        return min(horizon, 1)
+    if f == SourceFrequency.QUARTERLY:
+        return min(horizon, 2)
+    return min(horizon, 3)
+
+
+# ---------------------------------------------------------------------------
+# Métricas (P17)
+# ---------------------------------------------------------------------------
+
+
+def _mse_mae(y_actual: np.ndarray, yhat: np.ndarray):
+    e = yhat - y_actual
+    n = len(e)
+    if n == 0:
+        return None, None, None, None
+    mae = np.mean(np.abs(e))
+    rmse = math.sqrt(np.mean(e**2))
+    wape = (
+        np.sum(np.abs(e)) / np.sum(np.abs(y_actual))
+        if np.sum(np.abs(y_actual)) > 0
+        else None
+    )
+    bias = float(np.mean(e))
+    return (
+        float(mae),
+        float(rmse),
+        (float(wape) if wape is not None else None),
+        float(bias),
+    )
+
+
+def _apply_floor(yhat: float) -> float:
+    """Piso zero obrigatório (secs 9.1 e 15)."""
+    if np.isnan(yhat) or np.isinf(yhat):
+        return yhat
+    return max(0.0, yhat)
+
+
+# ---------------------------------------------------------------------------
+# Avaliação temporal e seleção (P16/P17)
+# ---------------------------------------------------------------------------
+
+
+def _extract_series(df: pl.DataFrame, series_id: str, measure: str) -> pl.DataFrame:
+    return df.filter(
+        pl.col("series_id") == series_id, pl.col("measure") == measure
+    ).sort("ds")
+
+
+def _add_cutoff_date(series: pl.DataFrame, cutoff: dt.date) -> pl.DataFrame:
+    return series.filter(pl.col("ds") <= cutoff)
+
+
+def evaluate_candidates(
+    data,
+    policy,
+    candidates,
+    windows,
+    regressors,
+    config: ForecastConfig | None = None,
+    entities=None,
+    ml_cv_preds: dict | None = None,
+) -> ForecastBatch:
+    """Avalia candidatos por série com folds temporais (sec 9.2).
+
+    O candidato global (LightGBM) é avaliado com previsões pré-computadas
+    (`ml_cv_preds`) geradas uma vez sobre toda a população da medida em
+    `run_forecast`; somente atinge esta função quando o complemento ML está
+    instalado. Sem `ml_cv_preds`, nenhum candidato `need_ml` concorre.
+    """
+    n_windows = len(windows)
+    cv_rows: list[dict] = []
+    score_rows: list[dict] = []
+    pred_rows: list[dict] = []
+    selec_rows: list[dict] = []
+    issues: list[ValidationIssue] = []
+
+    if hasattr(data, "prepared"):
+        prepared = data.prepared
+    else:
+        prepared = data
+
+    # previsões dos modelos globais por fold (um treino por corte/medida).
+    # ml_cv_preds pode ser {alias: {(node,cutoff,ds): pred}} (novo) ou
+    # {(node,cutoff,ds): pred} legado (LightGBM único).
+    ml_preds_by_alias: dict[str, dict] = {}
+    ml_candidates = [c for c in candidates if c.need_ml]
+    if ml_candidates and ml_cv_preds:
+        if ml_cv_preds and all(isinstance(k, str) for k in ml_cv_preds.keys()):
+            ml_preds_by_alias = ml_cv_preds
+        else:
+            ml_preds_by_alias = {"LightGBM": ml_cv_preds}
+
+    series_by = {}
+    for (series_id, measure), grp in prepared.group_by(["series_id", "measure"]):
+        series_by[(series_id, measure)] = grp.sort("ds")
+
+    # Pass 1: elegibilidade por série (mesma regra de antes, sem fits).
+    eligible_by_series: dict = {}
+    short_series: set = set()
+    for (series_id, measure), series in series_by.items():
+        n = series.height
+        if n < 4:
+            short_series.add((series_id, measure))
+            continue
+        yvals = series["y"].to_numpy()
+        positives = (yvals > 0).sum()
+        all_zero = bool((yvals == 0).all())
+        has_negatives = bool((yvals < 0).any())
+        eligible_aliases: list[str] = []
+        for c in candidates:
+            if c.need_ml:
+                continue
+            ok = True
+            if c.requires_positives and has_negatives:
+                ok = False
+            if c.intermittent:
+                if has_negatives or positives < MIN_INTERMITTENT_POSITIVES:
+                    ok = False
+            if all_zero:
+                ok = False
+            if ok and c.alias != "ZeroBaseline":
+                eligible_aliases.append(c.alias)
+        if all_zero:
+            eligible_aliases = ["ZeroBaseline"]
+        eligible_by_series[(series_id, measure)] = eligible_aliases
+
+    # Pass 2 vetorizado: 1 StatsForecast por (modelo, fold) com todas as
+    # séries elegíveis + n_jobs entre séries (ganho 10-50x vs 1 fit/série).
+    freq_cv = _freq_from_windows(windows)
+    season_cv = _season_length(freq_cv)
+    njobs = _sf_n_jobs(config)
+    VECTOR_OK = {
+        a
+        for a in {c.alias for c in candidates if not c.need_ml}
+        if _build_sf_model(a, season_cv) is not None
+    }
+    panel_evals: dict = {}
+    for alias in sorted(VECTOR_OK):
+        scope = [
+            (sid, m)
+            for (sid, m), aliases in eligible_by_series.items()
+            if alias in aliases
+        ]
+        if not scope:
+            continue
+        try:
+            rows = _run_folds_panel(
+                prepared, scope, alias, windows, freq_cv, season_cv, njobs
+            )
+        except Exception:  # noqa: BLE001
+            rows = None
+        if not rows:
+            # fallback por série preserva motivos de falha granulares
+            for sid, m in scope:
+                series = series_by[(sid, m)]
+                _, eval_per_fold = _run_folds(
+                    series,
+                    alias,
+                    candidates,
+                    windows,
+                    study=None,
+                    regressors=regressors,
+                    data=data,
+                    policy=policy,
+                    measure=m,
+                    node_id=sid,
+                    entities=entities,
+                )
+                for cv in eval_per_fold:
+                    panel_evals.setdefault((sid, m, alias), []).append(cv)
+            continue
+        for cv in rows:
+            panel_evals.setdefault((cv["node_id"], cv["measure"], alias), []).append(cv)
+
+    for series_id, measure in short_series:
+        node_id = series_id
+        cv_rows.append(
+            {
+                "node_id": node_id,
+                "measure": measure,
+                "model_alias": "Naive",
+                "cutoff": None,
+                "ds": None,
+                "y_actual": None,
+                "yhat": None,
+                "evaluated": False,
+                "failure_reason": "insufficient_history",
+            }
+        )
+        score_rows.append(
+            {
+                "node_id": node_id,
+                "measure": measure,
+                "model_alias": "Naive",
+                "mae": None,
+                "rmse": None,
+                "wape": None,
+                "bias": None,
+                "n_eval": 0,
+                "n_folds": 0,
+                "eligible": False,
+                "failure_reason": "insufficient_history",
+            }
+        )
+
+    # Pass 3: monta scores por série (ML pré-computado + painel + X/Zero locais).
+    for (series_id, measure), series in series_by.items():
+        node_id = series_id
+        if (series_id, measure) in short_series:
+            continue
+        eligible_aliases = list(eligible_by_series.get((series_id, measure), []))
+
+        scores_raw: dict[str, dict] = {}
+        for ml_cand in ml_candidates:
+            ml_preds = ml_preds_by_alias.get(ml_cand.alias, {})
+            if not ml_preds:
+                continue
+            ml_evals = [ev for k, ev in ml_preds.items() if k[0] == node_id]
+            if not ml_evals:
+                continue
+            actual_map = {r["ds"]: r["y"] for r in series.to_dicts()}
+            ml_eval_rows = [
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": ml_cand.alias,
+                    "cutoff": k[1],
+                    "ds": k[2],
+                    "y_actual": actual_map.get(k[2]),
+                    "yhat": _apply_floor(float(ev["yhat"]))
+                    if ev.get("yhat") is not None
+                    else None,
+                    "evaluated": k[2] in actual_map,
+                    "failure_reason": "" if k[2] in actual_map else "no_observed_test",
+                }
+                for k, ev in ml_preds.items()
+                if k[0] == node_id
+            ]
+            for ev in ml_eval_rows:
+                cv_rows.append(ev)
+            scores_raw[ml_cand.alias] = _score_from_evals(ml_eval_rows, n_windows)
+            eligible_aliases.append(ml_cand.alias)
+        ml_aliases = {c.alias for c in ml_candidates}
+        for alias in eligible_aliases:
+            if alias in ml_aliases:
+                continue
+            eval_per_fold = panel_evals.get((node_id, measure, alias))
+            if eval_per_fold is None:
+                # não-vetorizável (ARIMAX/Zero): caminho local original
+                _, eval_per_fold = _run_folds(
+                    series,
+                    alias,
+                    candidates,
+                    windows,
+                    study=None,
+                    regressors=regressors,
+                    data=data,
+                    policy=policy,
+                    measure=measure,
+                    node_id=node_id,
+                    entities=entities,
+                )
+            for cv in eval_per_fold:
+                cv_rows.append(cv)
+            if not any(ev["evaluated"] for ev in eval_per_fold):
+                scores_raw[alias] = None
+                continue
+            ys = np.array(
+                [ev["y_actual"] for ev in eval_per_fold if ev["evaluated"]]
+            ).astype(float)
+            yh = np.array(
+                [_apply_floor(ev["yhat"]) for ev in eval_per_fold if ev["evaluated"]]
+            ).astype(float)
+            mae, rmse, wape, bias = _mse_mae(ys, yh)
+            scores_raw[alias] = {
+                "mae": mae,
+                "rmse": rmse,
+                "wape": wape,
+                "bias": bias,
+                "n_eval": int(len(ys)),
+                "n_folds": n_windows,
+                "eligible": True,
+            }
+        winner, reason, fallback = _select_winner(scores_raw, eligible_aliases)
+        for alias in scores_raw:
+            s = scores_raw[alias]
+            score_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": alias,
+                    "mae": s["mae"] if s else None,
+                    "rmse": s["rmse"] if s else None,
+                    "wape": s["wape"] if s else None,
+                    "bias": s["bias"] if s else None,
+                    "n_eval": s["n_eval"] if s else 0,
+                    "n_folds": s["n_folds"] if s else 0,
+                    "eligible": bool(s) if s is not None else False,
+                    "failure_reason": "" if s else "no_evaluable_folds",
+                }
+            )
+        selec_rows.append(
+            {
+                "node_id": node_id,
+                "measure": measure,
+                "model_alias": winner,
+                "selection_reason": reason,
+                "cv_horizon": _largest_h(windows),
+                "n_folds": n_windows,
+                "fallback_used": bool(fallback),
+                "clipped_count": 0,
+            }
+        )
+
+    return ForecastBatch(
+        predictions=pl.DataFrame(pred_rows or _empty_pred()),
+        cv_predictions=pl.DataFrame(cv_rows or _empty_cv()),
+        scores=pl.DataFrame(score_rows or _empty_scores()),
+        selection=pl.DataFrame(selec_rows or _empty_select()),
+        issues=issues,
+    )
+
+
+def _largest_h(windows: list[CVWindow]) -> int:
+    return windows[-1].eval_dates.__len__() if windows else 0
+
+
+def _run_folds(
+    series,
+    alias,
+    candidates,
+    windows,
+    study,
+    regressors,
+    data,
+    policy,
+    measure: str,
+    node_id: str,
+    entities=None,
+):
+    """Roda folds para um candidato/série; devolve (preds, eval) alinhados."""
+    if alias == "AutoARIMA_X":
+        return _run_regressor_folds(
+            series, regressors, entities, windows, node_id, measure
+        )
+    from statsforecast import StatsForecast
+    from statsforecast.models import (
+        Naive,
+        HistoricAverage,
+        SeasonalNaive,
+        AutoETS,
+        AutoTheta,
+        CrostonSBA,
+        TSB,
+        AutoCES,
+        AutoARIMA,
+        AutoTBATS,
+        WindowAverage,
+        SeasonalWindowAverage,
+        RandomWalkWithDrift,
+        Holt,
+        HoltWinters,
+    )
+
+    def _window(w: int):
+        return lambda: WindowAverage(window_size=w)
+
+    model_map = {
+        "Naive": lambda: Naive(),
+        "MediaMovel3": _window(3),
+        "MediaMovel6": _window(6),
+        "MediaMovel12": _window(12),
+        "HistoricAverage": lambda: HistoricAverage(),
+        "SeasonalNaive": lambda: SeasonalNaive(season_length=12),
+        "RegLinearDrift": lambda: RandomWalkWithDrift(),
+        "Holt": lambda: Holt(season_length=1),
+        "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
+        "CrostonSBA": lambda: CrostonSBA(),
+        "TSB": lambda: TSB(alpha_d=0.2, alpha_p=0.2),
+        "AutoETS": lambda: AutoETS(),
+        "ETS_Damped": lambda: AutoETS(damped=True),
+        "AutoTheta": lambda: AutoTheta(),
+        "AutoCES": lambda: AutoCES(),
+        "AutoTBATS": lambda: AutoTBATS(season_length=12),
+        "AutoARIMA": lambda: AutoARIMA(
+            season_length=12,
+            max_p=3,
+            max_q=3,
+            max_P=1,
+            max_Q=1,
+            max_order=5,
+            approximation=True,
+        ),
+    }
+    if alias == "ZeroBaseline":
+        return _zero_baseline(series, windows, node_id, measure)
+    if alias not in model_map:
+        return [], []
+    eval_rows: list[dict] = []
+    pred_rows: list[dict] = []
+    series_id = series["series_id"].first()
+    if hasattr(data, "prepared"):
+        trained_inputs = data.prepared
+    else:
+        trained_inputs = data
+    freq = _freq_from_windows(windows)
+    season_len = _season_length(freq)
+    if alias == "SeasonalNaive":
+        model_map["SeasonalNaive"] = lambda: SeasonalNaive(season_length=season_len)
+    if alias == "AutoARIMA":
+        model_map["AutoARIMA"] = lambda: AutoARIMA(
+            season_length=season_len,
+            max_p=3,
+            max_q=3,
+            max_P=1,
+            max_Q=1,
+            max_order=5,
+            approximation=True,
+        )
+    for w in windows:
+        train = trained_inputs.filter(
+            pl.col("series_id") == series_id,
+            pl.col("measure") == measure,
+            pl.col("ds") <= w.cutoff,
+        ).sort("ds")
+        if train.height < 4:
+            continue
+        mdl = model_map[alias]()
+        try:
+            sf = StatsForecast(
+                models=[mdl],
+                freq=_freq_str(freq),
+                n_jobs=1,
+                fallback_model=Naive(),
+            )
+            df = train.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
+                ["unique_id", "ds", "y"]
+            ]
+            fc = sf.forecast(df=df, h=len(w.eval_dates), level=[80])
+        except Exception as e:  # noqa: BLE001
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": alias,
+                    "cutoff": w.cutoff,
+                    "ds": None,
+                    "y_actual": None,
+                    "yhat": None,
+                    "evaluated": False,
+                    "failure_reason": str(e)[:200],
+                }
+            )
+            continue
+        test = series.filter(pl.col("ds") > w.cutoff).sort("ds")
+        test_map = {r["ds"]: r["y"] for r in test.to_dicts()}
+        fc_rows = fc.to_dicts()
+        for i, (ds_fc, row) in enumerate(zip(w.eval_dates, fc_rows)):
+            yhat = _extract_yhat(row, alias)
+            act = test_map.get(ds_fc)
+            evaluated = act is not None
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": alias,
+                    "cutoff": w.cutoff,
+                    "ds": ds_fc,
+                    "y_actual": float(act) if evaluated else None,
+                    "yhat": float(_apply_floor(yhat)),
+                    "evaluated": evaluated,
+                    "failure_reason": "" if evaluated else "no_observed_test",
+                }
+            )
+    return pred_rows, eval_rows
+
+
+def _first_pred_value(row: dict) -> float:
+    for v in row.values():
+        if isinstance(v, float) or isinstance(v, int):
+            return float(v)
+    return 0.0
+
+
+def _extract_yhat(row: dict, alias: str) -> float:
+    """Extrai a previsão pontual da linha devolvida pelo StatsForecast."""
+    for key in (alias, "AutoETS", "unique_id"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    # lo-80/hi-80 presentes; yhat é fianl a primeira chave não-lo/hi
+    for k, v in row.items():
+        if k not in ("ds", "lo-80", "hi-80", "unique_id") and isinstance(
+            v, (int, float)
+        ):
+            return float(v)
+    return 0.0
+
+
+def _fc_model_type(model) -> str:
+    return type(model).__name__
+
+
+def _sf_n_jobs(config=None) -> int:
+    """Paralelismo do StatsForecast entre séries (usa os 8 núcleos)."""
+    import os as _os
+
+    try:
+        cfg_n = int(getattr(config, "n_jobs", 0) or 0)
+    except Exception:  # noqa: BLE001
+        cfg_n = 0
+    if cfg_n and cfg_n > 1:
+        return cfg_n
+    return max(1, min(8, _os.cpu_count() or 4))
+
+
+def _build_sf_model(alias: str, season_len: int):
+    """Fábrica única de modelos StatsForecast (CV e final usam a mesma)."""
+    from statsforecast.models import (
+        Naive,
+        HistoricAverage,
+        SeasonalNaive,
+        AutoETS,
+        AutoTheta,
+        CrostonSBA,
+        TSB,
+        AutoCES,
+        AutoARIMA,
+        AutoTBATS,
+        WindowAverage,
+        RandomWalkWithDrift,
+        Holt,
+    )
+
+    if alias == "SeasonalNaive":
+        return SeasonalNaive(season_length=season_len)
+    if alias == "AutoARIMA":
+        return AutoARIMA(
+            season_length=season_len,
+            max_p=3,
+            max_q=3,
+            max_P=1,
+            max_Q=1,
+            max_order=5,
+            approximation=True,
+        )
+    if alias == "AutoTBATS":
+        return AutoTBATS(season_length=season_len)
+    table = {
+        "Naive": Naive,
+        "MediaMovel3": lambda: WindowAverage(window_size=3),
+        "MediaMovel6": lambda: WindowAverage(window_size=6),
+        "MediaMovel12": lambda: WindowAverage(window_size=12),
+        "HistoricAverage": HistoricAverage,
+        "RegLinearDrift": RandomWalkWithDrift,
+        "Holt": lambda: Holt(season_length=1),
+        "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
+        "CrostonSBA": CrostonSBA,
+        "AutoETS": AutoETS,
+        "ETS_Damped": lambda: AutoETS(damped=True),
+        "AutoTheta": AutoTheta,
+        "AutoCES": AutoCES,
+    }
+    if alias == "TSB":
+        return TSB(alpha_d=0.2, alpha_p=0.2)
+    factory = table.get(alias)
+    if factory is None:
+        return None
+    return factory() if callable(factory) else factory
+
+
+def _run_folds_panel(
+    prepared,
+    scope: list[tuple[str, str]],
+    alias: str,
+    windows,
+    freq,
+    season_len: int,
+    n_jobs: int,
+) -> list[dict]:
+    """CV vetorizado: 1 StatsForecast por (modelo, fold) com todas as séries.
+
+    `scope` = [(node_id=series_id, measure)]. Devolve eval rows no mesmo
+    formato do `_run_folds` por série. Em falha do painel, o chamador faz
+    fallback por série para preservar motivos de falha granulares.
+    """
+    from statsforecast import StatsForecast
+    from statsforecast.models import Naive as _Naive
+
+    eval_rows: list[dict] = []
+    mdl = _build_sf_model(alias, season_len)
+    if mdl is None:
+        return eval_rows
+    freq_str = _freq_str(freq)
+    for w in windows:
+        h = len(w.eval_dates)
+        trains = []
+        tests: dict = {}
+        for node_id, measure in scope:
+            tr = prepared.filter(
+                pl.col("series_id") == node_id,
+                pl.col("measure") == measure,
+                pl.col("ds") <= w.cutoff,
+            ).sort("ds")
+            if tr.height < 4:
+                continue
+            trains.append(
+                tr.select(
+                    pl.col("series_id").alias("unique_id"), pl.col("ds"), pl.col("y")
+                )
+            )
+            te = prepared.filter(
+                pl.col("series_id") == node_id,
+                pl.col("measure") == measure,
+                pl.col("ds") > w.cutoff,
+            ).sort("ds")
+            tests[(node_id, measure)] = {r["ds"]: r["y"] for r in te.to_dicts()}
+        if not trains:
+            continue
+        panel = pl.concat(trains).sort(["unique_id", "ds"])
+        sf = StatsForecast(
+            models=[_build_sf_model(alias, season_len)],
+            freq=freq_str,
+            n_jobs=n_jobs,
+            fallback_model=_Naive(),
+        )
+        fc = sf.forecast(df=panel, h=h, level=[80])
+        for row in fc.to_dicts():
+            uid = str(row.get("unique_id"))
+            ds = row.get("ds")
+            try:
+                from datetime import date as _date
+
+                if hasattr(ds, "date"):
+                    ds = ds.date()
+                elif isinstance(ds, str):
+                    ds = _date.fromisoformat(ds[:10])
+            except Exception:  # noqa: BLE001
+                pass
+            # recupera (node_id, measure) — series_id já é único por medida
+            match = next((k for k in tests if k[0] == uid), None)
+            if match is None:
+                continue
+            node_id, measure = match
+            act = tests[match].get(ds)
+            evaluated = act is not None
+            try:
+                yhat = float(_apply_floor(_extract_yhat(row, alias)))
+            except Exception:  # noqa: BLE001
+                yhat = None
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": alias,
+                    "cutoff": w.cutoff,
+                    "ds": ds,
+                    "y_actual": float(act) if evaluated else None,
+                    "yhat": yhat,
+                    "evaluated": evaluated,
+                    "failure_reason": "" if evaluated else "no_observed_test",
+                }
+            )
+    return eval_rows
+
+
+def _zero_baseline(series, windows, node_id, measure):
+    eval_rows = []
+    pred_rows = []
+    for w in windows:
+        test = series.filter(pl.col("ds") > w.cutoff).sort("ds")
+        test_map = {r["ds"]: r["y"] for r in test.to_dicts()}
+        for ds_fc in w.eval_dates:
+            act = test_map.get(ds_fc)
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": "ZeroBaseline",
+                    "cutoff": w.cutoff,
+                    "ds": ds_fc,
+                    "y_actual": act,
+                    "yhat": 0.0,
+                    "evaluated": act is not None,
+                    "failure_reason": "" if act is not None else "no_observed_test",
+                }
+            )
+    return pred_rows, eval_rows
+
+
+def _score_from_evals(eval_rows: list[dict], n_windows: int) -> dict:
+    """Calcula métricas a partir de eval rows (usado para o modelo global)."""
+    evaluated = [e for e in eval_rows if e.get("evaluated")]
+    if not evaluated:
+        return {
+            "mae": None,
+            "rmse": None,
+            "wape": None,
+            "bias": None,
+            "n_eval": 0,
+            "n_folds": n_windows,
+            "eligible": False,
+        }
+    ys = np.array([e["y_actual"] for e in evaluated]).astype(float)
+    yh = np.array([_apply_floor(e["yhat"]) for e in evaluated]).astype(float)
+    mae, rmse, wape, bias = _mse_mae(ys, yh)
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "wape": wape,
+        "bias": bias,
+        "n_eval": int(len(ys)),
+        "n_folds": n_windows,
+        "eligible": True,
+    }
+
+
+def _select_winner(
+    scores_raw: dict, eligible_aliases: list[str]
+) -> tuple[str, str, bool]:
+    """Ranking por MAE com tolerância de 1% e fallback (sec 9.3)."""
+    ranked = [a for a in eligible_aliases if scores_raw.get(a)]
+    if not ranked:
+        return "Naive", SelectionReason.FALLBACK.value, True
+    scored = [(scores_raw[a]["mae"], RANK_BY_ALIAS.get(a, 1000), a) for a in ranked]
+    scored.sort(key=lambda t: (math.inf if t[0] is None else t[0], t[1]))
+    best_mae, _, best_alias = scored[0]
+    # tolerância 1%
+    near = [
+        (t[2], t[1])
+        for t in scored
+        if t[0] is not None and t[0] <= best_mae * TIE_TOLERANCE + 1e-12
+    ]
+    near.sort(key=lambda t: t[1])
+    winner = near[0][0]
+    reason = (
+        SelectionReason.BEST_MAE.value
+        if winner == best_alias
+        else SelectionReason.TIE_BREAK.value
+    )
+    return winner, reason, False
+
+
+def select_models(scores, config: ForecastConfig) -> SelectionResult:
+    """Selects por série/medida a partir de frame de scores (P17)."""
+    rows = {"selection": scores, "ranking_notes": {}, "median_n_folds": 0}
+    best = scores.filter(pl.col("eligible") == True)
+    return SelectionResult(best, {}, 0)
+
+
+# ---------------------------------------------------------------------------
+# Previsão final e intervalos (P18)
+# ---------------------------------------------------------------------------
+
+
+def _gen_future_dates(last_ds: dt.date, freq: SourceFrequency, h: int) -> list[dt.date]:
+    return [_add_period(last_ds, freq, i) for i in range(1, h + 1)]
+
+
+def forecast_final(
+    series: pl.DataFrame,
+    alias: str,
+    horizon: int,
+    freq: SourceFrequency,
+    config: ForecastConfig,
+    regressors: list[RegressorSpec] = None,
+    df_all: pl.DataFrame | None = None,
+    entities=None,
+    future_overrides: dict | None = None,
+) -> tuple[list[dict], str]:
+    """Reajusta vencedor sobre todo o histórico elegível e projeta h passos."""
+    if alias in ("LightGBM", "XGBoost"):
+        if df_all is None:
+            return [], "ml_needs_global_frame"
+        return ml_final(
+            df_all,
+            str(series["series_id"].first()),
+            str(series["measure"].first()),
+            freq,
+            horizon,
+            seed=config.seed,
+            n_jobs=config.n_jobs,
+            model_name=alias,
+        )
+    if alias == "AutoARIMA_X":
+        return _forecast_regressor_final(
+            series,
+            horizon,
+            freq,
+            config,
+            regressors or [],
+            entities,
+            future_overrides=future_overrides,
+        )
+
+    from statsforecast import StatsForecast
+    from statsforecast.models import (
+        Naive,
+        HistoricAverage,
+        SeasonalNaive,
+        AutoETS,
+        AutoTheta,
+        CrostonSBA,
+        TSB,
+        AutoCES,
+        AutoARIMA,
+        AutoTBATS,
+        WindowAverage,
+        RandomWalkWithDrift,
+        Holt,
+    )
+
+    season_len = _season_length(freq)
+    model_map = {
+        "Naive": lambda: Naive(),
+        "MediaMovel3": lambda: WindowAverage(window_size=3),
+        "MediaMovel6": lambda: WindowAverage(window_size=6),
+        "MediaMovel12": lambda: WindowAverage(window_size=12),
+        "HistoricAverage": lambda: HistoricAverage(),
+        "SeasonalNaive": lambda: SeasonalNaive(season_length=season_len),
+        "RegLinearDrift": lambda: RandomWalkWithDrift(),
+        "Holt": lambda: Holt(season_length=1),
+        "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
+        "CrostonSBA": lambda: CrostonSBA(),
+        "TSB": lambda: TSB(alpha_d=0.2, alpha_p=0.2),
+        "AutoETS": lambda: AutoETS(),
+        "ETS_Damped": lambda: AutoETS(damped=True),
+        "AutoTheta": lambda: AutoTheta(),
+        "AutoCES": lambda: AutoCES(),
+        "AutoTBATS": lambda: AutoTBATS(season_length=season_len),
+        "AutoARIMA": lambda: AutoARIMA(
+            season_length=season_len,
+            max_p=3,
+            max_q=3,
+            max_P=1,
+            max_Q=1,
+            max_order=5,
+            approximation=True,
+        ),
+    }
+    if alias == "ZeroBaseline":
+        last = series["ds"].max()
+        rows = []
+        for d in _gen_future_dates(last, freq, horizon):
+            rows.append(
+                {
+                    "ds": d,
+                    "yhat": 0.0,
+                    "lo80": None,
+                    "hi80": None,
+                    "interval_method": IntervalMethod.NULL.value,
+                    "clipped": 0,
+                }
+            )
+        return rows, "ok"
+    if alias not in model_map:
+        return [], "unknown_model"
+    freq_str = _freq_str(freq)
+    try:
+        mdl = model_map[alias]()
+        df = series.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
+            ["unique_id", "ds", "y"]
+        ]
+        sf = StatsForecast(
+            models=[mdl], freq=freq_str, n_jobs=1, fallback_model=Naive()
+        )
+        fc = sf.forecast(df=df, h=horizon, level=[80])
+    except Exception as e:  # noqa: BLE001
+        return [], str(e)[:200]
+    last = series["ds"].max()
+    # Guarda conformal (sec 9.4): só há intervalo quando o histórico comporta duas
+    # janelas de calibração do horizonte solicitado + treino mínimo residual.
+    n_history = series.height
+    conformal_ok = n_history >= 2 * horizon + INT_MIN_HISTORY_REGULAR
+    rows = []
+    for i, row in enumerate(fc.to_dicts(), start=1):
+        yhat = float(row.get(alias, _extract_yhat(row, alias)))
+        lo80 = row.get(f"{alias}-lo-80")
+        hi80 = row.get(f"{alias}-hi-80")
+        if lo80 is None:
+            lo80 = row.get("lo-80")
+        if hi80 is None:
+            hi80 = row.get("hi-80")
+        if not conformal_ok:
+            lo80, hi80 = None, None
+        clipped = 0
+        if yhat != yhat:  # NaN
+            continue
+        if yhat < 0:
+            yhat = 0.0
+            clipped = 1
+        lo80 = _apply_floor(float(lo80)) if lo80 is not None else None
+        hi80 = _apply_floor(float(hi80)) if hi80 is not None else None
+        if lo80 is not None and hi80 is not None and lo80 > hi80:
+            lo80, hi80 = None, None
+        im = (
+            IntervalMethod.NATIVE.value
+            if lo80 is not None
+            else (
+                IntervalMethod.UNAVAILABLE_INSUFFICIENT_HISTORY.value
+                if not conformal_ok
+                else IntervalMethod.NULL.value
+            )
+        )
+        rows.append(
+            {
+                "ds": _add_period(last, freq, i),
+                "yhat": float(yhat),
+                "lo80": lo80,
+                "hi80": hi80,
+                "interval_method": im,
+                "clipped": clipped,
+            }
+        )
+    return rows, "ok"
+
+
+def forecast_candidate(
+    series: pl.DataFrame, alias: str, study, config: ForecastConfig
+) -> tuple[list[dict], str]:
+    """Previsão futura de UM candidato específico, sob demanda (T6.4).
+
+    Reusa `forecast_final` sem a cadeia de fallback: se o candidato pedido
+    falhar, devolve `status != "ok"` em vez de silenciosamente trocar de
+    modelo — o comparador de modelos do dashboard precisa saber que ESSE
+    modelo não funcionou nesta série, não ver a saída de outro modelo.
+    """
+    return forecast_final(
+        series, alias, config.horizon_periods, study.model_frequency, config
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lotes e rodada (P19)
+# ---------------------------------------------------------------------------
+
+
+def _empty_pred() -> list[dict]:
+    return [
+        {
+            "node_id": "",
+            "entity_id": "",
+            "level": "",
+            "measure": "",
+            "scenario_id": "base",
+            "ds": dt.date(2000, 1, 1),
+            "yhat": 0.0,
+            "lo80": None,
+            "hi80": None,
+            "model_alias": "",
+            "interval_method": "",
+            "status": "",
+        }
+    ]
+
+
+def _empty_cv() -> list[dict]:
+    return [
+        {
+            "node_id": "",
+            "measure": "",
+            "model_alias": "",
+            "cutoff": dt.date(2000, 1, 1),
+            "ds": dt.date(2000, 1, 1),
+            "y_actual": None,
+            "yhat": None,
+            "evaluated": False,
+            "failure_reason": "",
+        }
+    ]
+
+
+def _empty_scores() -> list[dict]:
+    return [
+        {
+            "node_id": "",
+            "measure": "",
+            "model_alias": "",
+            "mae": None,
+            "rmse": None,
+            "wape": None,
+            "bias": None,
+            "n_eval": 0,
+            "n_folds": 0,
+            "eligible": False,
+            "failure_reason": "",
+        }
+    ]
+
+
+def _empty_select() -> list[dict]:
+    return [
+        {
+            "node_id": "",
+            "measure": "",
+            "model_alias": "",
+            "selection_reason": "",
+            "cv_horizon": 0,
+            "n_folds": 0,
+            "fallback_used": False,
+            "clipped_count": 0,
+        }
+    ]
+
+
+def _forecast_with_fallback(
+    series,
+    alias: str,
+    candidates,
+    config: ForecastConfig,
+    study,
+    regressors,
+    df_all,
+    entities=None,
+    override=None,
+):
+    """Tenta o vencedor; em falha, segue a ordem de ranking e termina em Naive.
+
+    Devolve (rows, used_alias, status, fallback_used). A saída finita já tem
+    piso zero aplicado por forecast_final. Nenhum stub aqui: se nenhum modelo
+    produzir previsão, retorna ([], alias, status, True) para a rodada contar
+    a série como falha e marcar run como parcial.
+    """
+    preference = [alias] + [
+        c.alias for c in sorted(candidates, key=lambda c: c.rank) if c.alias != alias
+    ]
+    if "Naive" not in preference:
+        preference.append("Naive")
+    for cand in preference:
+        rows, status = forecast_final(
+            series,
+            cand,
+            config.horizon_periods,
+            study.model_frequency,
+            config,
+            regressors,
+            df_all=df_all,
+            entities=entities,
+            future_overrides=override if cand == "AutoARIMA_X" else None,
+        )
+        if rows and status == "ok":
+            return rows, cand, status, cand != alias
+    rows, status = forecast_final(
+        series,
+        "Naive",
+        config.horizon_periods,
+        study.model_frequency,
+        config,
+        regressors,
+        df_all=df_all,
+        entities=entities,
+    )
+    if rows and status == "ok":
+        return rows, "Naive", status, "Naive" != alias
+    return [], alias, status, True
+
+
+def _cancel_requested(should_cancel) -> bool:
+    """Consulta o flag opcional de cancelamento apenas ENTRE lotes (sec 4/8.2).
+
+    Nunca é invocado dentro de uma chamada estatística/cv em andamento, então uma
+    rodada não promete cancelamento imediato de um lote já em execução.
+    """
+    return should_cancel is not None and should_cancel()
+
+
+def _consolidate_partial(
+    batch_out: list[ForecastBatch], preds: list[dict]
+) -> ForecastBatch:
+    """Monta um ForecastBatch parcial a partir do que já foi produzido.
+
+    Usado quando o usuário cancela a rodada: as previsões finais talvez estejam
+    incompletas, mas cv/scores/selection das etapas concluídas são preservados
+    para diagnóstico (sec 8.2). Não inventa zeros para o que falta.
+    """
+    pred_df = pl.DataFrame(preds or _empty_pred())
+    cv_df = (
+        pl.concat([b.cv_predictions for b in batch_out]) if batch_out else _empty_cv()
+    )
+    scores_df = (
+        pl.concat([b.scores for b in batch_out]) if batch_out else _empty_scores()
+    )
+    sel_df = (
+        pl.concat([b.selection for b in batch_out]) if batch_out else _empty_select()
+    )
+    issues = [iss for b in batch_out for iss in b.issues]
+    return ForecastBatch(pred_df, cv_df, scores_df, sel_df, issues)
+
+
+def _cancelled_event(
+    batch_out: list[ForecastBatch],
+    preds: list[dict],
+    n_failed: int,
+    total: int,
+    nodes: pl.DataFrame | None = None,
+) -> RunEvent:
+    return RunEvent(
+        RunStage.CANCELLED,
+        len(preds),
+        total,
+        "Rodada cancelada pelo usuário; resultados parciais de folds foram preservados.",
+        payload={
+            "batch": _consolidate_partial(batch_out, preds),
+            "n_failed": n_failed,
+            "n_predictions": len(preds),
+            "partial": True,
+            "nodes": nodes,
+        },
+    )
+
+
+def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
+    """Fluxo de eventos em lotes: profile -> cv -> forecast -> scenario -> reconcile."""
+    config = inputs.config
+    study = inputs.study
+    prepared = inputs.prepared
+    hierarchy = config.hierarchy
+    node_meta: dict[str, dict] | None = None
+    node_mode = ""
+    # hierarquia (P25/P26): monta nós e, em independente agregado, agrega o treino
+    working = prepared
+    if (
+        hierarchy
+        and hierarchy.ordered_levels
+        and inputs.entities is not None
+        and inputs.entities.height
+    ):
+        _node_rows, node_meta = build_hierarchy_nodes(inputs.entities, hierarchy)
+        if hierarchy.mode == HierarchyMode.INDEPENDENT:
+            level_names = [tuple(lv) for lv in hierarchy.ordered_levels]
+            fc = (
+                tuple(hierarchy.forecast_level)
+                if hierarchy.forecast_level is not None
+                else level_names[-1]
+            )
+            if fc in level_names:
+                lvl_idx = level_names.index(fc)
+                if lvl_idx < len(level_names) - 1:
+                    working = aggregate_history(
+                        prepared, inputs.entities, hierarchy, lvl_idx
+                    )
+                    node_mode = "independent_aggregate"
+                else:
+                    node_mode = "leaf"
+            else:
+                node_mode = "leaf"
+        elif hierarchy.mode == HierarchyMode.MINTRACE:
+            node_mode = "mintrace"
+        else:
+            node_mode = "bottom_up"
+    all_series = working["series_id"].unique().to_list()
+    total = len(all_series)
+    nodes_frame = build_run_nodes(prepared, inputs.entities, hierarchy, node_meta)
+
+    yield RunEvent(RunStage.STARTED, 0, total, "Rodada iniciada.")
+    candidates = build_candidates(None, study, config)
+    wanted_ml = set(getattr(config, "candidate_aliases", []) or [])
+    if (
+        config.enable_ml
+        and _ml_available()
+        and (not wanted_ml or "LightGBM" in wanted_ml)
+    ):
+        candidates.append(
+            _make_spec(
+                "LightGBM",
+                need_ml=True,
+                global_model=True,
+                min_train=ML_MIN_ROWS,
+                rank=RANK_BY_ALIAS["LightGBM"],
+            )
+        )
+    if (
+        config.enable_ml
+        and _xgb_available()
+        and (not wanted_ml or "XGBoost" in wanted_ml)
+    ):
+        candidates.append(
+            _make_spec(
+                "XGBoost",
+                need_ml=True,
+                global_model=True,
+                min_train=ML_MIN_ROWS,
+                rank=RANK_BY_ALIAS["XGBoost"],
+            )
+        )
+
+    windows = build_cv_windows(working, study, config)
+    yield RunEvent(
+        RunStage.PROFILE, 0, total, f"Validação temporal com {len(windows)} folds."
+    )
+
+    # Pré-computa previsões dos candidatos globais por medida/corte.
+    ml_cv_preds: dict[str, dict] = {}
+    ml_aliases_to_train = [c.alias for c in candidates if c.need_ml]
+    if config.enable_ml and ml_aliases_to_train:
+        gdf = working.rename({"series_id": "unique_id"})[
+            ["unique_id", "measure", "ds", "y"]
+        ].sort(["unique_id", "ds"])
+        for ml_alias in ml_aliases_to_train:
+            alias_preds: dict[tuple, dict] = {}
+            for measure in sorted(set(gdf["measure"].to_list())):
+                n_series_measure = gdf.filter(pl.col("measure") == measure)[
+                    "unique_id"
+                ].n_unique()
+                if n_series_measure < ML_MIN_ENTITIES:
+                    continue
+                for w in windows:
+                    try:
+                        out, status = ml_forecast_fold(
+                            gdf,
+                            gdf["unique_id"].unique().to_list(),
+                            w.cutoff,
+                            study.model_frequency,
+                            measure,
+                            len(w.eval_dates),
+                            seed=config.seed,
+                            n_jobs=config.n_jobs,
+                            model_name=ml_alias,
+                        )
+                        if status == "ok" and out is not None:
+                            for r in out.to_dicts():
+                                key = (str(r["unique_id"]), w.cutoff, r["ds"])
+                                alias_preds[key] = r
+                    except Exception:  # noqa: BLE001
+                        continue
+            if alias_preds:
+                ml_cv_preds[ml_alias] = alias_preds
+
+    preds: list[dict] = []
+    n_failed = 0
+    batch_out: list[ForecastBatch] = []
+    for i in range(0, len(all_series), config.batch_size):
+        if _cancel_requested(inputs.should_cancel):
+            yield _cancelled_event(batch_out, preds, n_failed, total, nodes=nodes_frame)
+            return
+        batch_ids = all_series[i : i + config.batch_size]
+        batch = working.filter(pl.col("series_id").is_in(batch_ids))
+        fb = evaluate_candidates(
+            batch,
+            inputs.policy,
+            candidates,
+            windows,
+            inputs.regressors,
+            config=config,
+            entities=inputs.entities,
+            ml_cv_preds=ml_cv_preds or None,
+        )
+        batch_out.append(fb)
+        yield RunEvent(
+            RunStage.CV,
+            min(i + config.batch_size, total),
+            total,
+            f"Folds avaliados para lote {i // config.batch_size + 1}.",
+            batch_id=f"cv-{i // config.batch_size}",
+        )
+
+    # previsões finais por série vencedora
+    winner_map: dict[str, str] = {}
+    if batch_out:
+        sel = pl.concat([b.selection for b in batch_out])
+        for r in sel.to_dicts():
+            winner_map[r["node_id"]] = r["model_alias"]
+
+    # frame global para o candidato LightGBM (uma linha por série em cada data)
+    df_all = (
+        working.rename({"series_id": "unique_id"})[
+            ["unique_id", "measure", "ds", "y"]
+        ].sort(["unique_id", "ds"])
+        if config.enable_ml
+        else None
+    )
+
+    # preds/n_failed, inicializados antes do loop de CV para o cancelamento
+    # parcial reutilizá-los; aqui não são redefinidos (sec 8.2).
+    for series_id in all_series:
+        if _cancel_requested(inputs.should_cancel):
+            yield _cancelled_event(batch_out, preds, n_failed, total, nodes=nodes_frame)
+            return
+        series = working.filter(pl.col("series_id") == series_id).sort("ds")
+        measure = series["measure"].first()
+        alias = winner_map.get(series_id, "Naive")
+        rows, used_alias, status, fallback_used = _forecast_with_fallback(
+            series,
+            alias,
+            candidates,
+            config,
+            study,
+            inputs.regressors,
+            df_all,
+            entities=inputs.entities,
+        )
+        if not rows:
+            n_failed += 1
+            yield RunEvent(
+                RunStage.FORECAST,
+                all_series.index(series_id) + 1,
+                total,
+                f"Série sem previsão ({measure}): {status}.",
+            )
+            continue
+        pred_status = (
+            PredictionStatus.FALLBACK.value
+            if fallback_used
+            else PredictionStatus.OK.value
+        )
+        for r in rows:
+            preds.append(
+                {
+                    "node_id": series_id,
+                    "entity_id": series["entity_id"].first(),
+                    "level": "folha",
+                    "measure": measure,
+                    "scenario_id": "base",
+                    "ds": r["ds"],
+                    "yhat": r["yhat"],
+                    "lo80": r["lo80"],
+                    "hi80": r["hi80"],
+                    "model_alias": used_alias,
+                    "interval_method": r["interval_method"],
+                    "status": pred_status,
+                }
+            )
+        yield RunEvent(
+            RunStage.FORECAST,
+            all_series.index(series_id) + 1,
+            total,
+            f"Previsão final para {measure}.",
+        )
+
+    if _cancel_requested(inputs.should_cancel):
+        yield _cancelled_event(batch_out, preds, n_failed, total, nodes=nodes_frame)
+        return
+
+    yield RunEvent(
+        RunStage.RECONCILE,
+        total,
+        total,
+        "Conciliação concluída.",
+        payload={
+            "n_predictions": len(preds),
+            "n_failed": n_failed,
+        },
+    )
+
+    # build ForecastBatch consolidado
+    pred_df = pl.DataFrame(preds or _empty_pred())
+    cv_df = pl.concat(
+        [b.cv_predictions for b in batch_out] if batch_out else [_empty_cv()]
+    )
+    scores_df = pl.concat(
+        [b.scores for b in batch_out] if batch_out else [_empty_scores()]
+    )
+    sel_df = pl.concat(
+        [b.selection for b in batch_out] if batch_out else [_empty_select()]
+    )
+    # cenários determinísticos sobre a previsão base (P22/P24)
+    scenario_issues: list[ValidationIssue] = []
+    scenario_factors = pl.DataFrame()
+    n_total_predictions = len(preds)
+    if preds:
+        reg_specs = {str(c.alias): c for c in candidates if c.alias == "AutoARIMA_X"}
+
+        def _recompute_base(sc):
+            """Reconstrói a base com X_future alterado (AutoARIMA_X) (P24)."""
+            if not getattr(sc, "regressor_future_overrides", None):
+                return pred_df
+            rows_re = []
+            for sid in all_series:
+                base_rows = pred_df.filter(pl.col("node_id") == sid)
+                alias = winner_map.get(sid, "Naive")
+                supports = alias == "AutoARIMA_X" and bool(
+                    inputs.regressors and reg_specs
+                )
+                if not supports:
+                    rows_re.extend(base_rows.to_dicts())
+                    continue
+                series = working.filter(pl.col("series_id") == sid).sort("ds")
+                r, used, status, fb_used = _forecast_with_fallback(
+                    series,
+                    alias,
+                    candidates,
+                    config,
+                    study,
+                    inputs.regressors,
+                    df_all,
+                    entities=inputs.entities,
+                    override=sc.regressor_future_overrides,
+                )
+                if not r:
+                    rows_re.extend(base_rows.to_dicts())
+                    continue
+                pstatus = (
+                    PredictionStatus.FALLBACK.value
+                    if fb_used
+                    else PredictionStatus.OK.value
+                )
+                for rr in r:
+                    rows_re.append(
+                        {
+                            "node_id": sid,
+                            "entity_id": series["entity_id"].first(),
+                            "level": "folha",
+                            "measure": series["measure"].first(),
+                            "scenario_id": "base",
+                            "ds": rr["ds"],
+                            "yhat": rr["yhat"],
+                            "lo80": rr["lo80"],
+                            "hi80": rr["hi80"],
+                            "model_alias": used,
+                            "interval_method": rr["interval_method"],
+                            "status": pstatus,
+                        }
+                    )
+            return pl.DataFrame(rows_re, schema=pred_df.schema) if rows_re else pred_df
+
+        scenario_df, scenario_issues, scenario_factors = generate_scenario_predictions(
+            pred_df,
+            inputs.scenarios,
+            inputs.entities,
+            recompute_base=_recompute_base,
+            regressors=inputs.regressors,
+            node_meta=node_meta if node_mode == "independent_aggregate" else None,
+        )
+        if scenario_df.height:
+            pred_df = pl.concat([pred_df, scenario_df])
+            n_total_predictions += scenario_df.height
+        yield RunEvent(
+            RunStage.SCENARIO,
+            total,
+            total,
+            f"Cenários aplicados: {scenario_df.height} previsões com fatores.",
+            payload={"n_scenario_predictions": scenario_df.height},
+        )
+    if node_mode in ("bottom_up", "mintrace") and node_meta:
+        pred_df = reconcile_bottom_up(pred_df, hierarchy, node_meta)
+        if node_mode == "mintrace":
+            pred_df = pred_df.with_columns(
+                pl.when(pl.col("model_alias") == "BottomUp")
+                .then(pl.lit("MinT"))
+                .otherwise(pl.col("model_alias"))
+                .alias("model_alias")
+            )
+        n_total_predictions = pred_df.height
+    all_issues = [b.issues for b in batch_out]
+    if scenario_issues:
+        all_issues = all_issues + [scenario_issues]
+    fb = ForecastBatch(
+        pred_df,
+        cv_df,
+        scores_df,
+        sel_df,
+        [i for grp in all_issues for i in grp],
+        scenario_factors=scenario_factors,
+    )
+    yield RunEvent(
+        RunStage.COMPLETED,
+        total,
+        total,
+        "Rodada concluída.",
+        payload={
+            "batch": fb,
+            "n_failed": n_failed,
+            "n_predictions": n_total_predictions,
+            "nodes": nodes_frame,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Premissas e cenários (P22)
+# ---------------------------------------------------------------------------
+
+
+def _rule_applies(rule: AssumptionRule, e: dict, p: dt.date) -> bool:
+    """Verifica se a regra produz fator para a entidade/período (sec 10.1)."""
+    if not rule.enabled:
+        return False
+    if rule.rate <= -1.0:
+        return False
+    if rule.start_period is None or p < rule.start_period:
+        return False
+    if rule.effect != EffectType.STEP and rule.end_period and p > rule.end_period:
+        return False
+    if e["entity_id"] in rule.excluded_entity_ids:
+        return False
+    return _entity_matches(e, rule.filters)
+
+
+def compile_assumptions(
+    entities: pl.DataFrame, periods: list[dt.date], rules: list[AssumptionRule]
+) -> pl.DataFrame:
+    """Expande regras por entidade/período em fatores, resolvendo prioridade."""
+    ent = entities.to_dicts()
+    rows: list[dict] = []
+    for rule in rules:
+        if not rule.enabled:
+            continue
+        for e in ent:
+            for p in periods:
+                if not _rule_applies(rule, e, p):
+                    continue
+                rows.append(
+                    {
+                        "entity_id": e["entity_id"],
+                        "period": p,
+                        "rule_id": rule.rule_id,
+                        "family": rule.family,
+                        "measure": rule.target_measure,
+                        "factor": _factor_for(rule, p),
+                        "priority": rule.priority,
+                        "rule_effect": rule.effect.value,
+                    }
+                )
+    if not rows:
+        return pl.DataFrame(
+            {
+                "entity_id": [],
+                "period": [],
+                "rule_id": [],
+                "family": [],
+                "measure": [],
+                "factor": [],
+                "priority": [],
+                "rule_effect": [],
+            },
+            schema={
+                "entity_id": pl.String,
+                "period": pl.Date,
+                "rule_id": pl.String,
+                "family": pl.String,
+                "measure": pl.String,
+                "factor": pl.Float64,
+                "priority": pl.Int64,
+                "rule_effect": pl.String,
+            },
+        )
+    # resolução de prioridade dentro da mesma família/entidade/medida/período
+    df = pl.DataFrame(rows).sort(
+        ["entity_id", "period", "family", "measure", "priority"]
+    )
+    dedup = df.unique(subset=["entity_id", "period", "family", "measure"], keep="last")
+    return dedup
+
+
+def scenario_conflicts(
+    entities: pl.DataFrame, periods: list[dt.date], rules: list[AssumptionRule]
+) -> list[ValidationIssue]:
+    """Detecta empate de prioridade em regras sobrepostas (sec 10.1).
+
+    Dentro da mesma família/entidade/medida/período, empate no maior priority
+    bloqueia o cenário; se o maior priority for único, ele vence sem conflito.
+    """
+    issues: list[ValidationIssue] = []
+    buckets: dict[tuple, list[tuple[int, str]]] = defaultdict(list)
+    for rule in rules:
+        if not rule.enabled:
+            continue
+        for e in entities.to_dicts():
+            for p in periods:
+                if not _rule_applies(rule, e, p):
+                    continue
+                key = (e["entity_id"], p, rule.family, rule.target_measure)
+                buckets[key].append((rule.priority, rule.rule_id))
+    for (eid, p, family, measure), items in buckets.items():
+        by_prio = sorted(items, key=lambda t: -t[0])
+        max_prio = by_prio[0][0]
+        tied = [t for t in by_prio if t[0] == max_prio]
+        if len(tied) >= 2:
+            issues.append(
+                ValidationIssue(
+                    code=ERR_SCENARIO_PRIORITY_TIE,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Empate de prioridade {max_prio} na família '{family}' "
+                        f"para a entidade {eid} em {p.isoformat()}; o cenário "
+                        "é bloqueado."
+                    ),
+                    entity_ids=[eid],
+                    details={
+                        "family": family,
+                        "measure": measure,
+                        "period": p.isoformat(),
+                        "rule_ids": [t[1] for t in tied],
+                    },
+                )
+            )
+    return issues
+
+
+def _annual_occurrences(rule: AssumptionRule, p: dt.date) -> int:
+    """Número de aniversários anuais do início até p, inclusive (sec 10.1)."""
+    if rule.effect != EffectType.ANNUAL_STEP or rule.start_period is None:
+        return 0
+    if p < rule.start_period:
+        return 0
+    s = rule.start_period
+    if p.day != s.day or p.month != s.month:
+        # datas do grid são o primeiro dia do período; o aniversário ocorre no
+        # mesmo mês/trimestre do início, na mesma posição do calendário.
+        anniv = (s.month, s.day)
+    else:
+        anniv = (s.month, s.day)
+    years = p.year - s.year
+    reached = (p.month, p.day) >= anniv
+    return years + (1 if reached else 0)
+
+
+def _factor_for(rule: AssumptionRule, p: dt.date) -> float:
+    if rule.effect == EffectType.ANNUAL_STEP:
+        k = _annual_occurrences(rule, p)
+        return (1 + rule.rate) ** k if k > 0 else 1.0
+    return 1 + rule.rate
+
+
+def _entity_matches(e: dict, filters: dict[str, list[str]]) -> bool:
+    if not filters:
+        return True
+    import json
+
+    try:
+        dims = json.loads(e.get("dimensions_json", "{}"))
+    except Exception:  # noqa: BLE001
+        dims = {}
+    for k, vals in filters.items():
+        if dims.get(k, "") not in vals:
+            return False
+    return True
+
+
+def apply_scenario(
+    predictions: pl.DataFrame, compiled_rules: pl.DataFrame
+) -> pl.DataFrame:
+    """Multiplica previsões por fatores das regras (yhat_scenario = yhat_base × fator).
+
+    Regras de famílias diferentes se compõem multiplicativamente (sec 10.1);
+    fatores de uma mesma família já foram resolvidos por prioridade em
+    compile_assumptions. Aplica piso zero e limita limites, quando presentes.
+    """
+    if compiled_rules.height == 0 or predictions.height == 0:
+        return predictions
+    fact = (
+        compiled_rules.rename({"period": "ds"})
+        .select(["entity_id", "ds", "measure", "factor"])
+        .group_by(["entity_id", "ds", "measure"])
+        .agg(pl.col("factor").product().alias("factor"))
+        .with_columns(pl.col("factor").fill_null(1.0))
+    )
+    out = predictions.join(fact, on=["entity_id", "ds", "measure"], how="left")
+    out = out.with_columns(
+        pl.when(pl.col("factor").is_null())
+        .then(pl.lit(1.0))
+        .otherwise(pl.col("factor"))
+        .alias("factor")
+    )
+    out = out.with_columns(
+        (out["yhat"] * out["factor"]).clip(lower_bound=0.0).alias("yhat"),
+        pl.when(out["lo80"].is_null())
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise((out["lo80"] * out["factor"]).clip(lower_bound=0.0))
+        .alias("lo80"),
+        pl.when(out["hi80"].is_null())
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise((out["hi80"] * out["factor"]).clip(lower_bound=0.0))
+        .alias("hi80"),
+    )
+    return out.drop([c for c in ("factor",) if c in out.columns])
+
+
+def apply_scenario_nodes(
+    predictions: pl.DataFrame,
+    compiled: pl.DataFrame,
+    node_meta: dict[str, dict],
+) -> tuple[pl.DataFrame, list[ValidationIssue]]:
+    """Aplica fatores por nó em previsão independente agregada (sec 11).
+
+    Se todas as entidades-folha de um nó compartilham o mesmo fator, o nó é
+    multiplicado por ele; se nenhuma folha é afetada, fator 1; se apenas parte
+    das folhas for afetada, a aplicação parcial é bloqueada (linha removida e
+    `ValidationIssue` emitido) — regra parcial nunca multiplica o nó inteiro.
+    """
+    if compiled.height == 0 or predictions.height == 0:
+        return predictions, []
+    leaf_of = _entity_to_leaf(node_meta)
+    # conjunto de nós-folha sob cada nó (qualquer nível que o projete)
+    node_leaves: dict[str, set] = {
+        str(nid): set(
+            leaf_of.get(str(eid), str(eid)) for eid in meta.get("entity_ids", set())
+        )
+        for nid, meta in node_meta.items()
+    }
+    fact: dict[tuple, float] = {}
+    for r in compiled.to_dicts():
+        leaf = leaf_of.get(r["entity_id"])
+        if leaf is None:
+            leaf = r["entity_id"]
+        fact[(leaf, r["period"], r["measure"])] = r["factor"]
+    rows_out: list[dict] = []
+    issues: list[ValidationIssue] = []
+    for r in predictions.to_dicts():
+        node_id = str(r["node_id"])
+        leaves = node_leaves.get(
+            node_id, {str(r["entity_id"])} if r["entity_id"] else {node_id}
+        )
+        ds = r["ds"]
+        measure = r["measure"]
+        affected = [
+            (l, fact[(l, ds, measure)]) for l in leaves if (l, ds, measure) in fact
+        ]
+        leaves_affected = {l for l, _ in affected}
+        leaves_unaffected = set(leaves) - leaves_affected
+        if not affected:
+            factor = 1.0
+        elif not leaves_unaffected and len({f for _, f in affected}) == 1:
+            factor = affected[0][1]
+        else:
+            issues.append(
+                ValidationIssue(
+                    code=ERR_SCENARIO_PARTIAL_NODE,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Premissa parcial no nó independente '{node_id}': "
+                        "a regra não cobre todas as folhas; aplicação bloqueada."
+                    ),
+                    entity_ids=[node_id],
+                )
+            )
+            continue
+        nr = dict(r)
+        nr["yhat"] = max(0.0, float(r["yhat"]) * factor)
+        if nr.get("lo80") is not None:
+            nr["lo80"] = max(0.0, nr["lo80"] * factor)
+        if nr.get("hi80") is not None:
+            nr["hi80"] = max(0.0, nr["hi80"] * factor)
+        rows_out.append(nr)
+    out = (
+        pl.DataFrame(rows_out, schema=predictions.schema)
+        if rows_out
+        else pl.DataFrame([], schema=predictions.schema)
+    )
+    return out, issues
+
+
+def _regressor_family_conflicts(
+    scenario: ScenarioConfig, reg_name_by_id: dict[str, str]
+) -> list[ValidationIssue]:
+    """Família usada como regressora (override) e multiplicador (regra) bloqueia."""
+    issues: list[ValidationIssue] = []
+    rule_families = {
+        r.family for r in scenario.rules if hasattr(r, "family") and r.family
+    }
+    for reg_id in scenario.regressor_future_overrides:
+        name = reg_name_by_id.get(reg_id, reg_id)
+        if name in rule_families:
+            issues.append(
+                ValidationIssue(
+                    code=ERR_SCENARIO_REG_FAMILY_DUP,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Cenário '{scenario.scenario_id}' usa a família '{name}' "
+                        "como regressora (override) e multiplicador (regra); evite "
+                        "dupla aplicação (sec 10.2)."
+                    ),
+                    details={"family": name, "scenario_id": scenario.scenario_id},
+                )
+            )
+    return issues
+
+
+def generate_scenario_predictions(
+    base_predictions: pl.DataFrame,
+    scenarios: list[ScenarioConfig],
+    entities: pl.DataFrame | None,
+    recompute_base: Any = None,
+    regressors: list[RegressorSpec] | None = None,
+    node_meta: dict[str, dict] | None = None,
+) -> tuple[pl.DataFrame, list[ValidationIssue], pl.DataFrame]:
+    """Gera previsões por cenário determinístico a partir da base (P22).
+
+    Devolve (scenario_predictions, issues, factors_trace). O cenário base é
+    preservado. Cenários sem regras replicam a base sob outro scenario_id;
+    conflitos de prioridade bloqueiam o cenário com ValidationIssue. O rastro
+    contém, por série/período, as regras aplicadas e o fator resultante.
+
+    `recompute_base(scenario)` (quando informado) devolve a previsão base
+    recalculada para cenários com `regressor_future_overrides` (P24); sem ela,
+    o override de regressora é ignorado neste estágio. Uma família usada ao
+    mesmo tempo como regressora (override) e multiplicador (regra) bloqueia o
+    cenário (sec 10.2). Com `node_meta` informado (independente agregado), as
+    regras são aplicadas por nó com bloqueio de escopo parcial (sec 11).
+    """
+    issues: list[ValidationIssue] = []
+    trace_rows: list[dict] = []
+    if base_predictions.height == 0 or entities is None or entities.height == 0:
+        return (
+            pl.DataFrame([], schema=base_predictions.schema),
+            issues,
+            pl.DataFrame(),
+        )
+    periods = sorted(set(base_predictions["ds"].to_list()))
+    reg_name_by_id = {r.regressor_id: r.name for r in (regressors or [])}
+    scenario_rows: list[dict] = []
+    added: set[tuple] = set()
+    for sc in scenarios:
+        if sc.scenario_id == "base":
+            continue
+        rules = [r for r in sc.rules if hasattr(r, "rule_id") and r.enabled]
+        if sc.regressor_future_overrides:
+            fam_conflicts = _regressor_family_conflicts(sc, reg_name_by_id)
+            if fam_conflicts:
+                issues.extend(fam_conflicts)
+                continue
+        base_for_sc = base_predictions
+        if sc.regressor_future_overrides and recompute_base is not None:
+            base_for_sc = recompute_base(sc)
+        if not rules:
+            for r in base_for_sc.to_dicts():
+                key = (r["node_id"], r["measure"], sc.scenario_id, r["ds"])
+                if key in added:
+                    continue
+                added.add(key)
+                scenario_rows.append(dict(r, scenario_id=sc.scenario_id))
+            continue
+        confl = scenario_conflicts(entities, periods, rules)
+        if confl:
+            issues.extend(confl)
+            continue
+        compiled = compile_assumptions(entities, periods, rules)
+        if compiled.height:
+            trace_rows.extend(compiled.to_dicts())
+        if node_meta is not None:
+            applied, node_issues = apply_scenario_nodes(
+                base_for_sc, compiled, node_meta
+            )
+            if node_issues:
+                issues.extend(node_issues)
+                continue
+        else:
+            applied = apply_scenario(base_for_sc, compiled)
+        applied = applied.with_columns(
+            pl.lit(sc.scenario_id, dtype=pl.String).alias("scenario_id")
+        )
+        for r in applied.to_dicts():
+            key = (r["node_id"], r["measure"], sc.scenario_id, r["ds"])
+            if key in added:
+                continue
+            added.add(key)
+            scenario_rows.append(r)
+    scenario_df = (
+        pl.DataFrame(scenario_rows, schema=base_predictions.schema)
+        if scenario_rows
+        else pl.DataFrame([], schema=base_predictions.schema)
+    )
+    trace_df = pl.DataFrame(trace_rows) if trace_rows else pl.DataFrame()
+    return scenario_df, issues, trace_df
+
+
+def derive_mat_derived(
+    history: pl.DataFrame,
+    predictions: pl.DataFrame,
+    n_lag: int = 12,
+) -> pl.DataFrame:
+    """Deriva visão MAT (acumulado de n meses encerrado em cada t) da série mensal.
+
+    Combina histórico preparado e previsão da mesma série/medida/cenário,
+    aplica piso zero nos componentes derivados e só emite posição quando os
+    n componentes existirem (sec 5.3). Não soma limites de intervalos.
+    """
+    rows: list[dict] = []
+    if predictions.height == 0:
+        return pl.DataFrame(
+            {
+                "node_id": [],
+                "measure": [],
+                "scenario_id": [],
+                "ds": [],
+                "mat": [],
+            },
+            schema={
+                "node_id": pl.String,
+                "measure": pl.String,
+                "scenario_id": pl.String,
+                "ds": pl.Date,
+                "mat": pl.Float64,
+            },
+        )
+    hist = history.rename({"series_id": "node_id"})[["node_id", "ds", "measure", "y"]]
+    for (node_id, measure, scenario_id), gp in predictions.group_by(
+        ["node_id", "measure", "scenario_id"]
+    ):
+        h = hist.filter(
+            pl.col("node_id") == node_id, pl.col("measure") == measure
+        ).select(["ds", "y"])
+        fc = gp.select(["ds", "yhat"]).rename({"yhat": "y"})
+        combined = pl.concat([h, fc]).sort("ds")
+        combined = combined.with_columns(
+            pl.col("y").clip(lower_bound=0.0).alias("y_floor")
+        )
+        combined = combined.with_columns(
+            pl.col("y_floor")
+            .rolling_sum(window_size=n_lag, min_samples=n_lag)
+            .alias("mat_sum")
+        )
+        future_dates = set(gp["ds"].to_list())
+        for r in combined.filter(pl.col("ds").is_in(future_dates)).to_dicts():
+            if r["mat_sum"] is None:
+                continue
+            rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "scenario_id": scenario_id,
+                    "ds": r["ds"],
+                    "mat": float(r["mat_sum"]),
+                }
+            )
+    if not rows:
+        return pl.DataFrame(
+            {
+                "node_id": [],
+                "measure": [],
+                "scenario_id": [],
+                "ds": [],
+                "mat": [],
+            },
+            schema={
+                "node_id": pl.String,
+                "measure": pl.String,
+                "scenario_id": pl.String,
+                "ds": pl.Date,
+                "mat": pl.Float64,
+            },
+        )
+    return pl.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Hierarquia (P25/P26)
+# ---------------------------------------------------------------------------
+
+
+def validate_hierarchy(hierarchy: HierarchyConfig, entities: pl.DataFrame) -> list[str]:
+    """Valida partições aninhadas e chave folha única (sec 11)."""
+    import json
+
+    errs: list[str] = []
+    if hierarchy is None or not hierarchy.ordered_levels:
+        return errs
+    levels = hierarchy.ordered_levels
+    prev: set = set()
+    for lv in levels:
+        s = set(lv)
+        if not s:
+            errs.append("Nível sem dimensões.")
+            continue
+        if prev and not prev.issubset(s):
+            errs.append(
+                f"Nível {lv} não contém as dimensões do anterior ({sorted(prev)})."
+            )
+        prev = s
+    if hierarchy.forecast_level:
+        flat = [tuple(lv) for lv in levels]
+        if tuple(hierarchy.forecast_level) not in flat:
+            errs.append("forecast_level precisa ser um dos níveis ordenados.")
+    # chave folha única (último nível identifica a entidade sem duplicidade)
+    if entities is not None and entities.height:
+        seen: dict[tuple, str] = {}
+        for row in entities.to_dicts():
+            try:
+                dims = json.loads(row.get("dimensions_json", "{}"))
+            except Exception:  # noqa: BLE001
+                dims = {}
+            key = tuple(dims.get(d, "") for d in levels[-1])
+            if key in seen and seen[key] != row["entity_id"]:
+                errs.append(
+                    f"Folhas distintas compartilham a chave {key} no nível "
+                    f"{levels[-1]}; hierarquia inválida."
+                )
+            seen[key] = row["entity_id"]
+    return errs
+
+
+def build_hierarchy_nodes(
+    entities: pl.DataFrame, hierarchy: HierarchyConfig
+) -> tuple[pl.DataFrame, dict[str, dict]]:
+    """Constrói metadados dos nós e o mapa node->meta (sec 11).
+
+    `ordered_levels` é a lista de níveis do topo para a folha, cada um um
+    superconjunto de dimensões do anterior. Devolve um frame de nós e
+    `node_meta` com `parent`, `children`, `level`, `level_name` e
+    `entity_ids` (entidades-folha sob o nó).
+    """
+    import json
+
+    levels = hierarchy.ordered_levels
+    leaf_level = len(levels) - 1
+    node_meta: dict[str, dict] = {}
+    for row in entities.to_dicts():
+        try:
+            dims = json.loads(row.get("dimensions_json", "{}"))
+        except Exception:  # noqa: BLE001
+            dims = {}
+        eid = row["entity_id"]
+        prev_node: str | None = None
+        for idx, lv in enumerate(levels):
+            key = tuple(dims.get(d, "") for d in lv)
+            nid = stable_id("h", idx, *key)
+            meta = node_meta.get(nid)
+            if meta is None:
+                meta = {
+                    "parent": None,
+                    "children": set(),
+                    "level": idx,
+                    "level_name": " > ".join(str(v) for v in key) if key else "total",
+                    "entity_ids": set(),
+                    "node_id": nid,
+                }
+                node_meta[nid] = meta
+            meta["entity_ids"].add(eid)
+            if prev_node is not None:
+                node_meta[prev_node]["children"].add(nid)
+                meta["parent"] = prev_node
+            prev_node = nid
+    node_rows = [
+        {
+            "node_id": meta["node_id"],
+            "level": meta["level"],
+            "level_name": meta["level_name"],
+            "parent_node_id": meta["parent"],
+            "entity_ids": sorted(meta["entity_ids"]),
+            "n_entities": len(meta["entity_ids"]),
+        }
+        for meta in node_meta.values()
+    ]
+    # enraizar nós do nível 0 sob um único total, se solicitado
+    if hierarchy.include_total:
+        total_id = stable_id("h", "total")
+        node_meta.setdefault(
+            total_id,
+            {
+                "parent": None,
+                "children": set(nid for nid, m in node_meta.items() if m["level"] == 0),
+                "level": -1,
+                "level_name": "Total",
+                "entity_ids": set(),
+                "node_id": total_id,
+            },
+        )
+        for nid, m in node_meta.items():
+            if m["level"] == 0:
+                m["parent"] = total_id
+    # garantir order determinística
+    if node_rows and "node_id" in node_rows[0]:
+        nf = pl.DataFrame(node_rows)
+    else:
+        nf = pl.DataFrame(
+            {
+                "node_id": [],
+                "level": [],
+                "level_name": [],
+                "parent_node_id": [],
+                "entity_ids": [],
+                "n_entities": [],
+            }
+        )
+    return nf, node_meta
+
+
+def _entity_to_leaf(node_meta: dict[str, dict]) -> dict[str, str]:
+    """entity_id -> node de folha (nível máximo) que a contém."""
+    leaf_level = max((m["level"] for m in node_meta.values()), default=0)
+    out: dict[str, str] = {}
+    for nid, meta in node_meta.items():
+        if meta["level"] != leaf_level:
+            continue
+        for eid in meta["entity_ids"]:
+            out[eid] = nid
+    return out
+
+
+def _entity_dimensions_json(entities: pl.DataFrame | None, entity_id: str) -> str:
+    """Retorna `dimensions_json` de uma entidade (ou '{}' se ausente)."""
+    import json as _json
+
+    if entities is None or entities.height == 0:
+        return "{}"
+    row = entities.filter(pl.col("entity_id") == entity_id)
+    if row.height == 0 or "dimensions_json" not in row.columns:
+        return "{}"
+    return str(row["dimensions_json"].first() or "{}")
+
+
+def build_run_nodes(
+    prepared: pl.DataFrame,
+    entities: pl.DataFrame | None,
+    hierarchy: HierarchyConfig | None,
+    node_meta: dict[str, dict] | None,
+) -> pl.DataFrame:
+    """Frame de nós da rodada para persistência em `run_nodes` (sec 8.1/11).
+
+    Inclui as séries preditas (nível `folha`, entity_id real) e os nós
+    hierárquicos do `node_meta` (nível `level_name`, com `coverage_json`
+    listando as entidades-folha sob o nó). Serve ao dashboard para filtrar
+    por nível/dimensão e reconstruir histórico de nós agregados sem importar
+    o motor de previsão em data_engine (arquitetura sec 3.2).
+    """
+    import json as _json
+
+    nodes: dict[str, dict] = {}
+    series_rows = prepared.group_by("series_id").agg(
+        pl.col("entity_id").first().alias("entity_id")
+    )
+    for r in series_rows.to_dicts():
+        sid = str(r["series_id"])
+        eid = str(r["entity_id"])
+        nodes[sid] = {
+            "node_id": sid,
+            "level": "folha",
+            "parent_node_id": None,
+            "entity_id": eid,
+            "dimensions_json": _entity_dimensions_json(entities, eid),
+            "coverage_json": _json.dumps(
+                {"entity_ids": [eid], "n_entities": 1}, ensure_ascii=False
+            ),
+        }
+    if node_meta:
+        for nid, meta in node_meta.items():
+            nid = str(nid)
+            if nid in nodes:
+                continue
+            eids = sorted(str(e) for e in (meta.get("entity_ids") or set()))
+            nodes[nid] = {
+                "node_id": nid,
+                "level": str(meta.get("level_name", "total")),
+                "parent_node_id": (
+                    str(meta["parent"]) if meta.get("parent") is not None else None
+                ),
+                "entity_id": eids[0] if len(eids) == 1 else None,
+                "dimensions_json": (
+                    _entity_dimensions_json(entities, eids[0])
+                    if len(eids) == 1
+                    else "{}"
+                ),
+                "coverage_json": _json.dumps(
+                    {"entity_ids": eids, "n_entities": len(eids)}, ensure_ascii=False
+                ),
+            }
+    rows = [nodes[nid] for nid in sorted(nodes)]
+    if not rows:
+        return pl.DataFrame(
+            {
+                "node_id": [],
+                "level": [],
+                "parent_node_id": [],
+                "entity_id": [],
+                "dimensions_json": [],
+                "coverage_json": [],
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+def aggregate_history(
+    prepared: pl.DataFrame,
+    entities: pl.DataFrame,
+    hierarchy: HierarchyConfig,
+    level: int,
+) -> pl.DataFrame:
+    """Agrega histórico preparado por nó de um nível, para previsão independente.
+
+    Folhas exibidas somam seus valores observados preparados; períodos com
+    filhos ausentes ficam com `observed=False` para o nó (não avaliados como
+    total completo). Usa `entity_id` de cada observação para localizar o nó.
+    """
+    import json
+
+    levels = hierarchy.ordered_levels
+    node_of_entity: dict[str, str] = {}
+    for row in entities.to_dicts():
+        try:
+            dims = json.loads(row.get("dimensions_json", "{}"))
+        except Exception:  # noqa: BLE001
+            dims = {}
+        key = tuple(dims.get(d, "") for d in levels[level])
+        node_of_entity[row["entity_id"]] = stable_id("h", level, *key)
+    df = prepared.with_columns(
+        pl.col("entity_id")
+        .map_elements(lambda e: node_of_entity.get(e, e), return_dtype=pl.String)
+        .alias("node_id")
+    ).with_columns(
+        pl.col("node_id").alias("series_id"),
+        pl.col("node_id").alias("entity_id"),
+    )
+    out = (
+        df.group_by(["node_id", "series_id", "entity_id", "ds", "measure"])
+        .agg(
+            pl.col("y").sum().alias("y"),
+            (pl.col("observed").all()).alias("observed"),
+        )
+        .with_columns(pl.lit(level).alias("level"))
+    )
+    return out.sort(["series_id", "ds"])
+
+
+def reconcile_bottom_up(
+    predictions: pl.DataFrame,
+    hierarchy: HierarchyConfig | None,
+    node_meta: dict[str, dict] | None = None,
+) -> pl.DataFrame:
+    """Soma folhas limitadas a zero para os nós pais (Bottom-Up), por cenário/medida.
+
+    Multi-nível: agrega do nível mais profundo ao topo. `node_meta` mapeia
+    node_id -> {"parent", "level", "level_name", ...}. Cobertura incompleta
+    gera `partial_coverage`; limites marginais nunca são somados.
+    """
+    if predictions.height == 0:
+        return predictions
+    base = predictions
+    if hierarchy is None or not node_meta:
+        return base.with_columns(pl.lit(None, dtype=pl.Float64).alias("_agg_unused"))
+
+    leaf_of = _entity_to_leaf(node_meta)
+    parent_by_node = {k: v.get("parent") for k, v in node_meta.items()}
+    children_by_parent: dict[str, list[str]] = {}
+    for node, parent in parent_by_node.items():
+        if parent:
+            children_by_parent.setdefault(parent, []).append(node)
+    if not children_by_parent:
+        return base.with_columns(pl.lit(None, dtype=pl.Float64).alias("_agg_unused"))
+
+    # camada 1: linhas de folha indexadas por nó de folha
+    rows = base.to_dicts()
+    leaf_rows: dict[tuple, list[dict]] = {}
+    for r in rows:
+        leaf = leaf_of.get(str(r["entity_id"]), str(r["node_id"]))
+        key = (leaf, r["scenario_id"], r["measure"], r["ds"])
+        leaf_rows.setdefault(key, []).append(r)
+
+    agg_rows = list(rows)
+    # a cada rodada, agrega o nível atual da fronteira nos seus pais
+    frontier: dict[tuple, dict] = {}
+    for (leaf, scenario, measure, ds), group in leaf_rows.items():
+        bucket = frontier.setdefault(
+            (leaf, scenario, measure, ds), {"sum": 0.0, "count": 0}
+        )
+        for r in group:
+            if r["yhat"] is not None:
+                bucket["sum"] += float(r["yhat"])
+            bucket["count"] += 1
+    while True:
+        parents_map: dict[tuple, dict] = {}
+        for (node, scenario, measure, ds), bucket in frontier.items():
+            parent = parent_by_node.get(node)
+            if parent is None:
+                continue
+            nk = (parent, scenario, measure, ds)
+            nb = parents_map.setdefault(nk, {"sum": 0.0, "children": set()})
+            nb["sum"] += bucket["sum"]
+            nb["children"].add(node)
+        if not parents_map:
+            break
+        for (node, scenario, measure, ds), nb in parents_map.items():
+            children = children_by_parent.get(node, [])
+            agg_rows.append(
+                {
+                    "node_id": node,
+                    "entity_id": node,
+                    "level": node_meta.get(node, {}).get("level_name", "total"),
+                    "measure": measure,
+                    "scenario_id": scenario,
+                    "ds": ds,
+                    "yhat": nb["sum"],
+                    "lo80": None,
+                    "hi80": None,
+                    "model_alias": "BottomUp",
+                    "interval_method": "unavailable_insufficient_history",
+                    "status": (
+                        "ok" if nb["children"] == set(children) else "partial_coverage"
+                    ),
+                }
+            )
+        frontier = parents_map
+
+    moves = pl.DataFrame(agg_rows)
+    moves = moves.with_columns(
+        pl.when(pl.col("yhat").is_null())
+        .then(pl.col("yhat"))
+        .otherwise(pl.col("yhat").clip(lower_bound=0.0))
+        .alias("yhat")
+    )
+    return moves.drop([c for c in moves.columns if c == "_agg_unused"])
+
+
+# ---------------------------------------------------------------------------
+# Aprendizado global (P28/P29)
+# ---------------------------------------------------------------------------
+
+ML_MIN_ENTITIES = 20
+ML_MIN_ROWS = 200
+
+
+def _ml_available() -> bool:
+    try:
+        import lightgbm  # noqa: F401
+        import mlforecast  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _xgb_available() -> bool:
+    try:
+        import xgboost  # noqa: F401
+        import mlforecast  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _ml_features(freq: SourceFrequency) -> tuple[list[int], list[str]]:
+    """Features causais do modelo global (sec 9.5), por frequência.
+
+    Lags [1,2,3] + lag sazonal quando elegível; o MLForecast também aplica a
+    média móvel causal de três observações via `RollingMean`; calendário por
+    frequência. As colunas são geradas no treino; a lista aqui documenta o
+    conjunto configurado em `train_global_model`.
+    """
+    season_len = _season_length(freq)
+    if freq in (SourceFrequency.MONTHLY, SourceFrequency.MAT):
+        lags = [1, 2, 3, season_len]
+        date_features = ["month", "year"]
+    elif freq == SourceFrequency.QUARTERLY:
+        lags = [1, 2, 3, season_len]
+        date_features = ["quarter", "year"]
+    else:
+        lags = [1, 2, 3]
+        date_features = ["year"]
+    return sorted(set(lags)), date_features
+
+
+def train_global_model(
+    df_all: pl.DataFrame,
+    cutoff,
+    freq: SourceFrequency,
+    measure: str,
+    seed: int = 42,
+    n_jobs: int = 1,
+    model_name: str = "LightGBM",
+):
+    """Treina MLForecast global (LightGBM/XGBoost), um modelo por medida."""
+    if model_name == "XGBoost":
+        if not _xgb_available():
+            return None, "ml_not_installed"
+    elif not _ml_available():
+        return None, "ml_not_installed"
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    from mlforecast import MLForecast
+    from mlforecast.lag_transforms import RollingMean
+
+    train = (
+        df_all.filter(pl.col("measure") == measure, pl.col("ds") <= cutoff)
+        .select(["unique_id", "ds", "y"])
+        .sort(["unique_id", "ds"])
+    )
+    n_entities = train["unique_id"].n_unique()
+    if n_entities < ML_MIN_ENTITIES or train.height < ML_MIN_ROWS:
+        return None, "below_minimum"
+    lags, date_features = _ml_features(freq)
+    if model_name == "XGBoost":
+        from xgboost import XGBRegressor
+
+        reg = XGBRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=6,
+            random_state=seed,
+            n_jobs=n_jobs,
+            verbosity=0,
+        )
+    else:
+        from lightgbm import LGBMRegressor
+
+        reg = LGBMRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            num_leaves=31,
+            random_state=seed,
+            n_jobs=n_jobs,
+            verbose=-1,
+        )
+    mlf = MLForecast(
+        models={model_name: reg},
+        freq=_pd_freq_str(freq),
+        lags=lags,
+        lag_transforms={1: [RollingMean(window_size=3)]},
+        date_features=date_features,
+    )
+    train_pd = train.to_pandas()
+    mlf.fit(train_pd[["unique_id", "ds", "y"]])
+    return mlf, "ok"
+
+
+def ml_forecast_fold(
+    df_all: pl.DataFrame,
+    series_ids: list[str],
+    cutoff,
+    freq,
+    measure: str,
+    horizon: int,
+    seed: int = 42,
+    n_jobs: int = 1,
+    model_name: str = "LightGBM",
+):
+    """Previsão global recursiva para as séries dadas (sem ler y do teste)."""
+    mlf, status = train_global_model(
+        df_all, cutoff, freq, measure, seed=seed, n_jobs=n_jobs, model_name=model_name
+    )
+    if status != "ok" or mlf is None:
+        return None, status
+    future = mlf.predict(h=horizon)
+    out = pl.from_pandas(future)
+    if model_name in out.columns and "yhat" not in out.columns:
+        out = out.rename({model_name: "yhat"})
+    out = out.with_columns(pl.col("ds").dt.date().alias("ds"))
+    out = out.filter(pl.col("unique_id").is_in(series_ids))
+    return out, "ok"
+
+
+def ml_final(
+    df_all: pl.DataFrame,
+    node_id: str,
+    measure: str,
+    freq: SourceFrequency,
+    horizon: int,
+    seed: int = 42,
+    n_jobs: int = 1,
+    model_name: str = "LightGBM",
+):
+    """Reajusta o modelo global da medida com todo o histórico e projeta h passos."""
+    mlf, status = train_global_model(
+        df_all,
+        df_all["ds"].max(),
+        freq,
+        measure,
+        seed=seed,
+        n_jobs=n_jobs,
+        model_name=model_name,
+    )
+    if status != "ok" or mlf is None:
+        return [], status
+    future = mlf.predict(h=horizon)
+    out = pl.from_pandas(future)
+    if model_name in out.columns:
+        out = out.rename({model_name: "yhat"})
+    out = out.with_columns(pl.col("ds").dt.date().alias("ds"))
+    out = out.filter(pl.col("unique_id") == node_id)
+    rows = []
+    for r in out.to_dicts():
+        y = float(r["yhat"]) if r.get("yhat") is not None else 0.0
+        rows.append(
+            {
+                "ds": r["ds"],
+                "yhat": _apply_floor(y),
+                "lo80": None,
+                "hi80": None,
+                "interval_method": IntervalMethod.UNAVAILABLE_INSUFFICIENT_HISTORY.value,
+                "clipped": 1 if y < 0 else 0,
+            }
+        )
+    return rows, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Regressoras (P24)
+# ---------------------------------------------------------------------------
+
+
+def build_future_regressors(entities, periods, specs, scenario) -> pl.DataFrame:
+    """Constrói frame future_x com regressoras declaradas e o override de cenário."""
+    cols = ["unique_id", "ds"]
+    rows = []
+    if not specs:
+        return pl.DataFrame(
+            {"unique_id": [], "ds": []}, schema={"unique_id": pl.String, "ds": pl.Date}
+        )
+    id_to_name = {s.regressor_id: s.name for s in specs}
+    for e in entities.to_dicts():
+        for p in periods:
+            row = {"unique_id": e["entity_id"], "ds": p}
+            for s in specs:
+                if not s.enabled:
+                    continue
+                v = s.future_values.get(p.isoformat())
+                if v is None:
+                    v = s.history_values.get(p.isoformat())
+                row[s.name] = v
+            # apply scenario override
+            if scenario and scenario.regressor_future_overrides:
+                for reg_id, overrides in scenario.regressor_future_overrides.items():
+                    name = id_to_name.get(reg_id, reg_id)
+                    if p.isoformat() in overrides:
+                        row[name] = overrides[p.isoformat()]
+            rows.append(row)
+    return pl.DataFrame(rows)
+
+
+def validate_regressors(
+    specs: list[RegressorSpec], history: dict, future_periods: list
+) -> list[ValidationIssue]:
+    """Valida variação, colinearidade e cobertura (sec 10.2)."""
+    issues: list[ValidationIssue] = []
+    if not specs:
+        return issues
+    for spec in specs:
+        if not spec.enabled:
+            continue
+        vals = [v for v in spec.history_values.values() if v not in (None, 0.0)]
+        if len(set(vals)) < 2:
+            issues.append(
+                ValidationIssue(
+                    code="E_REGRESSOR_FLAT",
+                    severity=Severity.WARNING,
+                    message=f"Regressora '{spec.name}' não tem variação histórica suficiente.",
+                )
+            )
+        missing_future = [
+            p for p in future_periods if p.isoformat() not in spec.future_values
+        ]
+        if missing_future and spec.known_in_advance:
+            issues.append(
+                ValidationIssue(
+                    code="E_REGRESSOR_INCOMPLETE_FUTURE",
+                    severity=Severity.WARNING,
+                    message=f"Regressora '{spec.name}' sem cobertura futura para {len(missing_future)} períodos.",
+                )
+            )
+        if not spec.known_in_advance and spec.fill_policy == RegressorFillPolicy.NONE:
+            issues.append(
+                ValidationIssue(
+                    code=ERR_REGRESSOR_UNAVAILABLE_AT_CUTOFF,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Regressora '{spec.name}' não é conhecida antecipadamente "
+                        "e não tem política de hold (explicit_hold); o candidato "
+                        "AutoARIMA_X fica indisponível."
+                    ),
+                )
+            )
+    # colinearidade perfeita entre pares de regressoras nos mesmos períodos
+    enabled = [s for s in specs if s.enabled]
+    for i in range(len(enabled)):
+        for j in range(i + 1, len(enabled)):
+            a, b = enabled[i], enabled[j]
+            common = sorted(set(a.history_values) & set(b.history_values))
+            pairs = [
+                (a.history_values[p], b.history_values[p])
+                for p in common
+                if a.history_values[p] is not None and b.history_values[p] is not None
+            ]
+            if len(pairs) < 3:
+                continue
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            corr = _pearson(xs, ys)
+            if corr is not None and corr > 0.999:
+                issues.append(
+                    ValidationIssue(
+                        code=ERR_REGRESSOR_COLLINEAR,
+                        severity=Severity.ERROR,
+                        message=(
+                            f"Regressoras '{a.name}' e '{b.name}' são quase "
+                            f"colineares (correlação {corr:.4f})."
+                        ),
+                    )
+                )
+    return issues
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    if not xs or len(xs) < 2:
+        return None
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = math.sqrt(sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys))
+    if den == 0:
+        return None
+    return num / den
+
+
+# ---------------------------------------------------------------------------
+# Regressoras AutoARIMA_X (P24)
+# ---------------------------------------------------------------------------
+
+
+def _entity_dims(entities, entity_id) -> dict:
+    if entities is None or entities.height == 0:
+        return {}
+    if entity_id is None:
+        return {}
+    import json
+
+    row = entities.filter(pl.col("entity_id") == str(entity_id))
+    if row.height == 0:
+        return {}
+    try:
+        return json.loads(row["dimensions_json"].first())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def regressor_applies(spec: RegressorSpec, entity_dim: dict) -> bool:
+    """Verifica se a regressora se aplica à entidade (escopo, sec 10.2)."""
+    if not spec.enabled:
+        return False
+    for k, vals in spec.scope_filters.items():
+        if entity_dim.get(k, "") not in vals:
+            return False
+    return True
+
+
+def regressor_x_history(
+    series: pl.DataFrame,
+    regressors: list[RegressorSpec],
+    entities,
+    cutoff=None,
+) -> pl.DataFrame | None:
+    """X_df histórico (unique_id, ds, colunas) da série, até o corte."""
+    if not regressors:
+        return None
+    dim = _entity_dims(entities, series["entity_id"].first())
+    dates = series["ds"].unique().to_list()
+    if cutoff is not None:
+        dates = [d for d in dates if d <= cutoff]
+    dates.sort()
+    if not dates:
+        return None
+    sid = str(series["series_id"].first())
+    base = pl.DataFrame({"unique_id": [sid] * len(dates), "ds": dates})
+    for spec in regressors:
+        if not regressor_applies(spec, dim):
+            continue
+        vals = [spec.history_values.get(d.isoformat()) for d in dates]
+        base = base.with_columns(pl.Series(spec.name, vals))
+    cols = [c for c in base.columns if c not in ("unique_id", "ds")]
+    if not cols:
+        return None
+    return base
+
+
+def regressor_x_future(
+    series: pl.DataFrame,
+    regressors: list[RegressorSpec],
+    entities,
+    future_dates: list[dt.date],
+    overrides: dict | None = None,
+) -> pl.DataFrame | None:
+    """X_future com política de disponibilidade (sec 10.2) e overrides de cenário.
+
+    `known_in_advance=true` usa future_values; `explicit_hold` repete o último
+    valor histórico; sem política, devolve None (futuro indisponível).
+    """
+    if not regressors:
+        return None
+    dim = _entity_dims(entities, series["entity_id"].first())
+    sid = str(series["series_id"].first())
+    last_ds = series["ds"].max()
+    base = pl.DataFrame(
+        {"unique_id": [sid] * len(future_dates), "ds": list(future_dates)}
+    )
+    for spec in regressors:
+        if not regressor_applies(spec, dim):
+            continue
+        if spec.known_in_advance:
+            vals = [spec.future_values.get(d.isoformat()) for d in future_dates]
+        elif spec.fill_policy == RegressorFillPolicy.EXPLICIT_HOLD:
+            hold = last_history_value(spec, last_ds)
+            vals = [hold] * len(future_dates)
+        else:
+            return None
+        base = base.with_columns(pl.Series(spec.name, vals))
+    if overrides:
+        id_to_name = {s.regressor_id: s.name for s in regressors}
+        for reg_id, ov in overrides.items():
+            name = id_to_name.get(reg_id, reg_id)
+            if name not in base.columns:
+                continue
+            for k, v in ov.items():
+                base = base.with_columns(
+                    pl.when(pl.col("ds").dt.strftime("%Y-%m-%d") == k)
+                    .then(pl.lit(v))
+                    .otherwise(pl.col(name))
+                    .alias(name)
+                )
+    cols = [c for c in base.columns if c not in ("unique_id", "ds")]
+    if not cols:
+        return None
+    return base
+
+
+def last_history_value(spec: RegressorSpec, last_ds) -> float | None:
+    """Último valor histórico da regressora até a data informada (hold)."""
+    best = None
+    best_key = ""
+    for k, v in spec.history_values.items():
+        if v is None:
+            continue
+        if k <= last_ds.isoformat() and (best is None or k > best_key):
+            best = v
+            best_key = k
+    return best
+
+
+def _forecast_regressor_final(
+    series,
+    horizon: int,
+    freq: SourceFrequency,
+    config: ForecastConfig,
+    regressors: list[RegressorSpec],
+    entities,
+    future_overrides: dict | None = None,
+) -> tuple[list[dict], str]:
+    """Refit final AutoARIMA_X: treino com exógenas + X_future (com overrides)."""
+    from statsforecast import StatsForecast
+    from statsforecast.models import AutoARIMA, Naive
+
+    if not regressors:
+        return [], "no_regressors"
+    x_train = regressor_x_history(series, regressors, entities)
+    if x_train is None:
+        return [], "regressor_unavailable"
+    last = series["ds"].max()
+    future_dates = _gen_future_dates(last, freq, horizon)
+    x_future = regressor_x_future(
+        series, regressors, entities, future_dates, overrides=future_overrides
+    )
+    if x_future is None:
+        return [], "regressor_future_unavailable"
+    season_len = _season_length(freq)
+    mdl = AutoARIMA(
+        season_length=season_len,
+        max_p=3,
+        max_q=3,
+        max_P=1,
+        max_Q=1,
+        max_order=5,
+        approximation=True,
+    )
+    df = series.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
+        ["unique_id", "ds", "y"]
+    ]
+    df = df.join(x_train.drop(["unique_id"]), on="ds", how="left")
+    sf = StatsForecast(
+        models=[mdl], freq=_freq_str(freq), n_jobs=1, fallback_model=Naive()
+    )
+    try:
+        fc = sf.forecast(df=df, h=horizon, X_df=x_future, level=[config.interval_level])
+    except Exception as e:  # noqa: BLE001
+        return [], str(e)[:200]
+    n_history = series.height
+    conformal_ok = n_history >= 2 * horizon + INT_MIN_HISTORY_REGULAR
+    rows = []
+    for i, row in enumerate(fc.to_dicts(), start=1):
+        yhat = float(row.get("AutoARIMA", _extract_yhat(row, "AutoARIMA")))
+        lo80 = row.get("AutoARIMA-lo-80")
+        hi80 = row.get("AutoARIMA-hi-80")
+        if not conformal_ok:
+            lo80, hi80 = None, None
+        if yhat != yhat:
+            continue
+        clipped = 1 if yhat < 0 else 0
+        if yhat < 0:
+            yhat = 0.0
+        lo80 = _apply_floor(float(lo80)) if lo80 is not None else None
+        hi80 = _apply_floor(float(hi80)) if hi80 is not None else None
+        if lo80 is not None and hi80 is not None and lo80 > hi80:
+            lo80, hi80 = None, None
+        im = (
+            IntervalMethod.NATIVE.value
+            if lo80 is not None
+            else (
+                IntervalMethod.UNAVAILABLE_INSUFFICIENT_HISTORY.value
+                if not conformal_ok
+                else IntervalMethod.NULL.value
+            )
+        )
+        rows.append(
+            {
+                "ds": _add_period(last, freq, i),
+                "yhat": float(yhat),
+                "lo80": lo80,
+                "hi80": hi80,
+                "interval_method": im,
+                "clipped": clipped,
+            }
+        )
+    return rows, "ok"
+
+
+def _run_regressor_folds(series, regressors, entities, windows, node_id, measure):
+    """Folds de AutoARIMA_X alinhados, com disponibilidade por fold."""
+    from statsforecast import StatsForecast
+    from statsforecast.models import AutoARIMA, Naive
+
+    freq = _freq_from_windows(windows)
+    season_len = _season_length(freq)
+    eval_rows: list[dict] = []
+    pred_rows: list[dict] = []
+    for w in windows:
+        x_train = regressor_x_history(series, regressors, entities, cutoff=w.cutoff)
+        if x_train is None:
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": "AutoARIMA_X",
+                    "cutoff": w.cutoff,
+                    "ds": None,
+                    "y_actual": None,
+                    "yhat": None,
+                    "evaluated": False,
+                    "failure_reason": "regressor_unavailable",
+                }
+            )
+            continue
+        x_future = regressor_x_future(series, regressors, entities, w.eval_dates)
+        if x_future is None:
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": "AutoARIMA_X",
+                    "cutoff": w.cutoff,
+                    "ds": None,
+                    "y_actual": None,
+                    "yhat": None,
+                    "evaluated": False,
+                    "failure_reason": "regressor_future_unavailable",
+                }
+            )
+            continue
+        train = series.filter(pl.col("ds") <= w.cutoff).sort("ds")
+        if train.height < 4:
+            continue
+        mdl = AutoARIMA(
+            season_length=season_len,
+            max_p=3,
+            max_q=3,
+            max_P=1,
+            max_Q=1,
+            max_order=5,
+            approximation=True,
+        )
+        df = train.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
+            ["unique_id", "ds", "y"]
+        ]
+        x_tr = x_train.filter(pl.col("ds") <= w.cutoff).drop(["unique_id"])
+        try:
+            sf = StatsForecast(
+                models=[mdl], freq=_freq_str(freq), n_jobs=1, fallback_model=Naive()
+            )
+            fc = sf.forecast(
+                df=df.join(x_tr, on="ds", how="left"),
+                h=len(w.eval_dates),
+                X_df=x_future,
+                level=[80],
+            )
+        except Exception as e:  # noqa: BLE001
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": "AutoARIMA_X",
+                    "cutoff": w.cutoff,
+                    "ds": None,
+                    "y_actual": None,
+                    "yhat": None,
+                    "evaluated": False,
+                    "failure_reason": str(e)[:200],
+                }
+            )
+            continue
+        test = series.filter(pl.col("ds") > w.cutoff).sort("ds")
+        test_map = {r["ds"]: r["y"] for r in test.to_dicts()}
+        for ds_fc, row in zip(w.eval_dates, fc.to_dicts()):
+            yhat = float(row.get("AutoARIMA", _extract_yhat(row, "AutoARIMA")))
+            act = test_map.get(ds_fc)
+            eval_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": "AutoARIMA_X",
+                    "cutoff": w.cutoff,
+                    "ds": ds_fc,
+                    "y_actual": float(act) if act is not None else None,
+                    "yhat": float(_apply_floor(yhat)),
+                    "evaluated": act is not None,
+                    "failure_reason": "" if act is not None else "no_observed_test",
+                }
+            )
+    return pred_rows, eval_rows

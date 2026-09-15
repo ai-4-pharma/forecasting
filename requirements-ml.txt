@@ -1,0 +1,8 @@
+# Forecast Community - complemento opcional: aprendizado global
+# Instalar apenas se o usuario quiser o modo avancado com MLForecast + LightGBM.
+# Depende do nucleo (requirements.txt) ja instalado.
+mlforecast==1.1.0
+lightgbm==4.7.0
+xgboost==2.1.4
+numba==0.64.0
+llvmlite==0.46.0
