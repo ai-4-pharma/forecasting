@@ -15,18 +15,25 @@ from contracts import (
     INT_MIN_HISTORY_REGULAR,
 )
 
-from .dates import _add_period, _freq_str, _gen_future_dates, _season_length
+from .dates import (
+    _add_period,
+    _effective_season_length,
+    _freq_str,
+    _gen_future_dates,
+)
 from .metrics import _apply_floor
 from .models import _extract_yhat
 from .regressors import _forecast_regressor_final
 from .ml import ml_final
-
+from ._quiet import quiet_native
 
 
 def _pkg_attr(name: str):
     """Lookup tardio no namespace do pacote (honra monkeypatch)."""
     import forecast_engine as _pkg
+
     return getattr(_pkg, name)
+
 
 def forecast_final(
     series: pl.DataFrame,
@@ -81,7 +88,7 @@ def forecast_final(
         Holt,
     )
 
-    season_len = _season_length(freq)
+    season_len = _effective_season_length(config, freq)
     model_map = {
         "Naive": lambda: Naive(),
         "MediaMovel3": lambda: WindowAverage(window_size=3),
@@ -94,11 +101,15 @@ def forecast_final(
         "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
         "CrostonSBA": lambda: CrostonSBA(),
         "TSB": lambda: TSB(alpha_d=0.2, alpha_p=0.2),
-        "AutoETS": lambda: AutoETS(),
-        "ETS_Damped": lambda: AutoETS(damped=True),
-        "AutoTheta": lambda: AutoTheta(),
-        "AutoCES": lambda: AutoCES(),
-        "AutoTBATS": lambda: AutoTBATS(season_length=season_len),
+        "AutoETS": lambda: AutoETS(season_length=season_len),
+        "ETS_Damped": lambda: AutoETS(season_length=season_len, damped=True),
+        "AutoTheta": lambda: AutoTheta(season_length=season_len),
+        "AutoCES": lambda: AutoCES(season_length=season_len),
+        "AutoTBATS": lambda: AutoTBATS(
+            season_length=season_len,
+            use_boxcox=False,
+            use_arma_errors=False,
+        ),
         "AutoARIMA": lambda: AutoARIMA(
             season_length=season_len,
             max_p=3,
@@ -132,10 +143,11 @@ def forecast_final(
         df = series.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
             ["unique_id", "ds", "y"]
         ]
-        sf = StatsForecast(
-            models=[mdl], freq=freq_str, n_jobs=1, fallback_model=Naive()
-        )
-        fc = sf.forecast(df=df, h=horizon, level=[80])
+        with quiet_native():
+            sf = StatsForecast(
+                models=[mdl], freq=freq_str, n_jobs=1, fallback_model=Naive()
+            )
+            fc = sf.forecast(df=df, h=horizon, level=[80])
     except Exception as e:  # noqa: BLE001
         return [], str(e)[:200]
     last = series["ds"].max()
@@ -251,4 +263,3 @@ def _forecast_with_fallback(
     if rows and status == "ok":
         return rows, "Naive", status, "Naive" != alias
     return [], alias, status, True
-

@@ -19,14 +19,22 @@ from contracts import (
     IntervalMethod,
     ERR_SCENARIO_REG_FAMILY_DUP,
     ERR_REGRESSOR_COLLINEAR,
+    ERR_REGRESSOR_INCOMPLETE_FUTURE,
     ERR_REGRESSOR_UNAVAILABLE_AT_CUTOFF,
     INT_MIN_HISTORY_REGULAR,
     RegressorFillPolicy,
 )
 
-from .dates import _add_period, _freq_from_windows, _freq_str, _gen_future_dates, _season_length
+from .dates import (
+    _add_period,
+    _effective_season_length,
+    _freq_from_windows,
+    _freq_str,
+    _gen_future_dates,
+)
 from .metrics import _apply_floor
 from .models import _extract_yhat
+from ._quiet import quiet_native
 
 
 def _regressor_family_conflicts(
@@ -60,35 +68,6 @@ def _regressor_family_conflicts(
 # ---------------------------------------------------------------------------
 
 
-def build_future_regressors(entities, periods, specs, scenario) -> pl.DataFrame:
-    """Constrói frame future_x com regressoras declaradas e o override de cenário."""
-    cols = ["unique_id", "ds"]
-    rows = []
-    if not specs:
-        return pl.DataFrame(
-            {"unique_id": [], "ds": []}, schema={"unique_id": pl.String, "ds": pl.Date}
-        )
-    id_to_name = {s.regressor_id: s.name for s in specs}
-    for e in entities.to_dicts():
-        for p in periods:
-            row = {"unique_id": e["entity_id"], "ds": p}
-            for s in specs:
-                if not s.enabled:
-                    continue
-                v = s.future_values.get(p.isoformat())
-                if v is None:
-                    v = s.history_values.get(p.isoformat())
-                row[s.name] = v
-            # apply scenario override
-            if scenario and scenario.regressor_future_overrides:
-                for reg_id, overrides in scenario.regressor_future_overrides.items():
-                    name = id_to_name.get(reg_id, reg_id)
-                    if p.isoformat() in overrides:
-                        row[name] = overrides[p.isoformat()]
-            rows.append(row)
-    return pl.DataFrame(rows)
-
-
 def validate_regressors(
     specs: list[RegressorSpec], history: dict, future_periods: list
 ) -> list[ValidationIssue]:
@@ -112,11 +91,29 @@ def validate_regressors(
             p for p in future_periods if p.isoformat() not in spec.future_values
         ]
         if missing_future and spec.known_in_advance:
+            # sem futuro E sem política de preenchimento, a regressora não pode
+            # ser usada: AutoARIMA_X ficaria indisponível em todas as séries.
+            no_future_at_all = not spec.future_values
+            no_fill = spec.fill_policy == RegressorFillPolicy.NONE
+            blocking = no_future_at_all and no_fill
             issues.append(
                 ValidationIssue(
-                    code="E_REGRESSOR_INCOMPLETE_FUTURE",
-                    severity=Severity.WARNING,
-                    message=f"Regressora '{spec.name}' sem cobertura futura para {len(missing_future)} períodos.",
+                    code=ERR_REGRESSOR_INCOMPLETE_FUTURE,
+                    severity=Severity.ERROR if blocking else Severity.WARNING,
+                    message=(
+                        (
+                            f"Regressora '{spec.name}' não tem valores futuros e nem "
+                            "política de preenchimento (explicit_hold): informe os "
+                            f"{len(missing_future)} períodos futuros do horizonte ou "
+                            "defina a política de preenchimento — sem isso o método "
+                            "AutoARIMA_X não pode ser executado."
+                        )
+                        if blocking
+                        else (
+                            f"Regressora '{spec.name}' sem cobertura futura para "
+                            f"{len(missing_future)} períodos."
+                        )
+                    ),
                 )
             )
         if not spec.known_in_advance and spec.fill_policy == RegressorFillPolicy.NONE:
@@ -322,7 +319,7 @@ def _forecast_regressor_final(
     )
     if x_future is None:
         return [], "regressor_future_unavailable"
-    season_len = _season_length(freq)
+    season_len = _effective_season_length(config, freq)
     mdl = AutoARIMA(
         season_length=season_len,
         max_p=3,
@@ -340,7 +337,10 @@ def _forecast_regressor_final(
         models=[mdl], freq=_freq_str(freq), n_jobs=1, fallback_model=Naive()
     )
     try:
-        fc = sf.forecast(df=df, h=horizon, X_df=x_future, level=[config.interval_level])
+        with quiet_native():
+            fc = sf.forecast(
+                df=df, h=horizon, X_df=x_future, level=[config.interval_level]
+            )
     except Exception as e:  # noqa: BLE001
         return [], str(e)[:200]
     n_history = series.height
@@ -383,13 +383,15 @@ def _forecast_regressor_final(
     return rows, "ok"
 
 
-def _run_regressor_folds(series, regressors, entities, windows, node_id, measure):
+def _run_regressor_folds(
+    series, regressors, entities, windows, node_id, measure, config=None
+):
     """Folds de AutoARIMA_X alinhados, com disponibilidade por fold."""
     from statsforecast import StatsForecast
     from statsforecast.models import AutoARIMA, Naive
 
     freq = _freq_from_windows(windows)
-    season_len = _season_length(freq)
+    season_len = _effective_season_length(config, freq)
     eval_rows: list[dict] = []
     pred_rows: list[dict] = []
     for w in windows:
@@ -442,15 +444,16 @@ def _run_regressor_folds(series, regressors, entities, windows, node_id, measure
         ]
         x_tr = x_train.filter(pl.col("ds") <= w.cutoff).drop(["unique_id"])
         try:
-            sf = StatsForecast(
-                models=[mdl], freq=_freq_str(freq), n_jobs=1, fallback_model=Naive()
-            )
-            fc = sf.forecast(
-                df=df.join(x_tr, on="ds", how="left"),
-                h=len(w.eval_dates),
-                X_df=x_future,
-                level=[80],
-            )
+            with quiet_native():
+                sf = StatsForecast(
+                    models=[mdl], freq=_freq_str(freq), n_jobs=1, fallback_model=Naive()
+                )
+                fc = sf.forecast(
+                    df=df.join(x_tr, on="ds", how="left"),
+                    h=len(w.eval_dates),
+                    X_df=x_future,
+                    level=[80],
+                )
         except Exception as e:  # noqa: BLE001
             eval_rows.append(
                 {
@@ -485,4 +488,3 @@ def _run_regressor_folds(series, regressors, entities, windows, node_id, measure
                 }
             )
     return pred_rows, eval_rows
-

@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal
 
 import polars as pl
 
@@ -41,11 +41,6 @@ class MatMode(str, enum.Enum):
     NONE = "none"
     DERIVED = "derived"
     DIRECT = "direct"
-
-
-class Measure(str, enum.Enum):
-    UNIDADES = "unidades"
-    VALOR = "valor"
 
 
 class DuplicateAction(str, enum.Enum):
@@ -140,11 +135,6 @@ class IntervalMethod(str, enum.Enum):
     CONFORMAL = "conformal"
     UNAVAILABLE_INSUFFICIENT_HISTORY = "unavailable_insufficient_history"
     NULL = "null"
-
-
-class IntervalRequirement(str, enum.Enum):
-    NONE = "none"
-    LEVEL80 = "level80"
 
 
 class SelectionReason(str, enum.Enum):
@@ -655,11 +645,14 @@ class ForecastConfig:
     hierarchy: HierarchyConfig | None = None
     regressor_ids: list[str] = field(default_factory=list)
     scenario_ids: list[str] = field(default_factory=lambda: ["base"])
+    season_length: int | None = None
 
     def validate(self) -> list[str]:
         errs: list[str] = []
         if self.horizon_periods < 1:
             errs.append("Horizonte deve ser ao menos 1 período.")
+        if self.season_length is not None and self.season_length < 1:
+            errs.append("Comprimento da sazonalidade deve ser ao menos 1 período.")
         if not self.nonnegative_output:
             errs.append(
                 "Piso zero é obrigatório; não é possível desativar nonnegative_output."
@@ -693,6 +686,7 @@ class ForecastConfig:
                 "hierarchy": h,
                 "regressor_ids": list(self.regressor_ids),
                 "scenario_ids": list(self.scenario_ids),
+                "season_length": self.season_length,
             }
         )
 
@@ -714,6 +708,7 @@ class ForecastConfig:
             hierarchy=None,
             regressor_ids=list(d.get("regressor_ids", [])),
             scenario_ids=list(d.get("scenario_ids", ["base"])),
+            season_length=d.get("season_length"),
         )
 
 
@@ -898,6 +893,7 @@ class ExportConfig:
     scenario_id: str = "base"
     measure: str | None = None
     level: str | None = None
+    model_alias: str | None = None
     filters: dict[str, list[str]] = field(default_factory=dict)
     temporal_view: TemporalView = TemporalView.CANONICAL
     include_intervals: bool = True
@@ -912,6 +908,7 @@ class ExportConfig:
                 "scenario_id": self.scenario_id,
                 "measure": self.measure,
                 "level": self.level,
+                "model_alias": self.model_alias,
                 "filters": self.filters,
                 "temporal_view": self.temporal_view.value,
                 "include_intervals": self.include_intervals,
@@ -1095,6 +1092,7 @@ class ResultFilter:
     node_id: str | None = None
     measure: str | None = None
     scenario_id: str = "base"
+    model_alias: str | None = None
     ds_start: date | None = None
     ds_end: date | None = None
     dimensions: dict[str, list[str]] = field(default_factory=dict)
@@ -1108,7 +1106,7 @@ class DashboardData:
     `predictions`, `scores` e `nodes` já vêm filtrados por `ResultFilter`.
     Os campos extras (P32) só são populados quando o filtro define uma **view
     única** (medida e cenário): `cards` (totais/variação/window UUID e MAT),
-    `metrics` (backtest agregado do vencedor), `history` (histórico preparado
+    `metrics` (backtest agregado por modelo), `history` (histórico preparado
     por nó) e `mat_view` (posições MAT no mesmo layout de `predictions`).
     """
 

@@ -159,8 +159,6 @@ def _entity_to_leaf(node_meta: dict[str, dict]) -> dict[str, str]:
 
 def _entity_dimensions_json(entities: pl.DataFrame | None, entity_id: str) -> str:
     """Retorna `dimensions_json` de uma entidade (ou '{}' se ausente)."""
-    import json as _json
-
     if entities is None or entities.height == 0:
         return "{}"
     row = entities.filter(pl.col("entity_id") == entity_id)
@@ -286,11 +284,13 @@ def reconcile_bottom_up(
     hierarchy: HierarchyConfig | None,
     node_meta: dict[str, dict] | None = None,
 ) -> pl.DataFrame:
-    """Soma folhas limitadas a zero para os nós pais (Bottom-Up), por cenário/medida.
+    """Soma folhas limitadas a zero para os nós pais (Bottom-Up), por cenário/medida/modelo.
 
     Multi-nível: agrega do nível mais profundo ao topo. `node_meta` mapeia
     node_id -> {"parent", "level", "level_name", ...}. Cobertura incompleta
-    gera `partial_coverage`; limites marginais nunca são somados.
+    gera `partial_coverage`; limites marginais nunca são somados. A soma é
+    FEITA POR MODELO: a rodada prevê todos os métodos escolhidos pelo usuário
+    (sem eleger vencedor) e cada parent preserva o model_alias dos filhos.
     """
     if predictions.height == 0:
         return predictions
@@ -307,20 +307,21 @@ def reconcile_bottom_up(
     if not children_by_parent:
         return base.with_columns(pl.lit(None, dtype=pl.Float64).alias("_agg_unused"))
 
-    # camada 1: linhas de folha indexadas por nó de folha
+    # camada 1: linhas de folha indexadas por (nó de folha, modelo)
     rows = base.to_dicts()
     leaf_rows: dict[tuple, list[dict]] = {}
     for r in rows:
         leaf = leaf_of.get(str(r["entity_id"]), str(r["node_id"]))
-        key = (leaf, r["scenario_id"], r["measure"], r["ds"])
+        alias = r.get("model_alias") or "Naive"
+        key = (leaf, r["scenario_id"], r["measure"], r["ds"], alias)
         leaf_rows.setdefault(key, []).append(r)
 
     agg_rows = list(rows)
     # a cada rodada, agrega o nível atual da fronteira nos seus pais
     frontier: dict[tuple, dict] = {}
-    for (leaf, scenario, measure, ds), group in leaf_rows.items():
+    for (leaf, scenario, measure, ds, alias), group in leaf_rows.items():
         bucket = frontier.setdefault(
-            (leaf, scenario, measure, ds), {"sum": 0.0, "count": 0}
+            (leaf, scenario, measure, ds, alias), {"sum": 0.0, "count": 0}
         )
         for r in group:
             if r["yhat"] is not None:
@@ -328,17 +329,17 @@ def reconcile_bottom_up(
             bucket["count"] += 1
     while True:
         parents_map: dict[tuple, dict] = {}
-        for (node, scenario, measure, ds), bucket in frontier.items():
+        for (node, scenario, measure, ds, alias), bucket in frontier.items():
             parent = parent_by_node.get(node)
             if parent is None:
                 continue
-            nk = (parent, scenario, measure, ds)
+            nk = (parent, scenario, measure, ds, alias)
             nb = parents_map.setdefault(nk, {"sum": 0.0, "children": set()})
             nb["sum"] += bucket["sum"]
             nb["children"].add(node)
         if not parents_map:
             break
-        for (node, scenario, measure, ds), nb in parents_map.items():
+        for (node, scenario, measure, ds, alias), nb in parents_map.items():
             children = children_by_parent.get(node, [])
             agg_rows.append(
                 {
@@ -351,7 +352,7 @@ def reconcile_bottom_up(
                     "yhat": nb["sum"],
                     "lo80": None,
                     "hi80": None,
-                    "model_alias": "BottomUp",
+                    "model_alias": alias,
                     "interval_method": "unavailable_insufficient_history",
                     "status": (
                         "ok" if nb["children"] == set(children) else "partial_coverage"
@@ -368,4 +369,3 @@ def reconcile_bottom_up(
         .alias("yhat")
     )
     return moves.drop([c for c in moves.columns if c == "_agg_unused"])
-

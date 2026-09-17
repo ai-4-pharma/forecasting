@@ -1,12 +1,30 @@
-# Forecast Community - dependencias do nucleo
-# Versoes testadas em 10/09/2026, Python 3.13.1 (window, CPython)
+# Forecast Community - dependencias (arquivo unico)
+# Versoes testadas em 17/09/2026, Python 3.13.1 (Windows, CPython).
+# Este arquivo instala tudo o que a aplicacao precisa, incluindo os metodos
+# globais (LightGBM/XGBoost) usados pelo checkbox "Habilitar aprendizado global".
+
+# --- Nucleo ---------------------------------------------------------------
 polars==1.44.2
 streamlit==1.63.0
 statsforecast==2.1.1
-hierarchicalforecast==1.5.1
 duckdb==1.1.3
 numpy==2.4.1
-pandas==2.3.3
 openpyxl==3.1.5
 plotly==5.24.1
+
+# --- Interoperabilidade (exigidas por streamlit / polars.to_pandas) -------
+pandas==2.3.3
 pyarrow==19.0.1
+
+# --- Aprendizado global (MLForecast + LightGBM + XGBoost) -----------------
+mlforecast==1.1.0
+lightgbm==4.7.0
+xgboost==2.1.4
+
+# Dependencias transitivas relevantes (instaladas automaticamente, sem pin
+# proprio): utilsforecast e scipy (via statsforecast), scikit-learn e optuna
+# (via mlforecast), altair (via streamlit).
+#
+# Opcional de desempenho: `numba` acelera os loops do utilsforecast usados no
+# caminho ML. Sem ele o pacote avisa que "algumas operacoes podem ficar lentas",
+# mas a aplicacao funciona -- por isso nao e obrigatorio aqui.

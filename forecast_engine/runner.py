@@ -5,6 +5,7 @@ Parte do pacote forecast_engine (fatiado do single-file).
 
 from __future__ import annotations
 
+import time
 from typing import Iterator
 import polars as pl
 
@@ -23,17 +24,23 @@ from .const import ML_MIN_ENTITIES, ML_MIN_ROWS, RANK_BY_ALIAS
 from .metrics import _empty_cv, _empty_pred, _empty_scores, _empty_select
 from .models import _make_spec, build_candidates
 from .ml import _xgb_available, ml_forecast_fold
-from .hierarchy import aggregate_history, build_hierarchy_nodes, build_run_nodes, reconcile_bottom_up
+from .hierarchy import (
+    aggregate_history,
+    build_hierarchy_nodes,
+    build_run_nodes,
+    reconcile_bottom_up,
+)
 from .cv import build_cv_windows, evaluate_candidates
-from .final import _forecast_with_fallback
+from .final import _forecast_with_fallback  # noqa: F401  (compat/uso em testes)
 from .scenarios import generate_scenario_predictions
-
 
 
 def _pkg_attr(name: str):
     """Lookup tardio no namespace do pacote (honra monkeypatch)."""
     import forecast_engine as _pkg
+
     return getattr(_pkg, name)
+
 
 def _cancel_requested(should_cancel) -> bool:
     """Consulta o flag opcional de cancelamento apenas ENTRE lotes (sec 4/8.2).
@@ -87,6 +94,43 @@ def _cancelled_event(
             "nodes": nodes,
         },
     )
+
+
+def _fmt_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return ""
+    if seconds < 90:
+        return f"~{int(round(seconds))}s restantes"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"~{minutes:.0f} min restantes"
+    return f"~{minutes / 60.0:.1f} h restantes"
+
+
+def _progress_message(
+    idx: int,
+    total: int,
+    measure: str,
+    alias: str,
+    model_idx: int,
+    n_models: int,
+    started_at: float,
+    ok: bool = True,
+) -> str:
+    """Texto de progresso por modelo: "X de N séries" + ETA simples.
+
+    A persistência só ocorre no fim da rodada, então o avanço visível por
+    série/modelo é o que evita a sensação de travamento em métodos lentos.
+    """
+    base = f"{measure} · {alias} ({model_idx}/{n_models}) — {idx} de {total} séries"
+    if not ok:
+        return f"{base} (sem saída)."
+    if idx < 3 or total <= 0:
+        return f"{base}."
+    elapsed = time.perf_counter() - started_at
+    per_series = elapsed / max(idx - 1, 1)
+    eta = _fmt_eta(per_series * (total - idx + 1))
+    return f"{base}" + (f" · {eta}." if eta else ".")
 
 
 def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
@@ -234,12 +278,14 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             batch_id=f"cv-{i // config.batch_size}",
         )
 
-    # previsões finais por série vencedora
-    winner_map: dict[str, str] = {}
+    # previsões finais: TODOS os modelos escolhidos pelo usuário por série
+    # (sem eleição de vencedor). A selection agora lista um alias por modelo
+    # elegível (decisão do usuário), e cada um desses é reajustado e projetado.
+    aliases_by_node: dict[str, list[str]] = {}
     if batch_out:
         sel = pl.concat([b.selection for b in batch_out])
         for r in sel.to_dicts():
-            winner_map[r["node_id"]] = r["model_alias"]
+            aliases_by_node.setdefault(r["node_id"], []).append(r["model_alias"])
 
     # frame global para o candidato LightGBM (uma linha por série em cada data)
     df_all = (
@@ -252,59 +298,89 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
 
     # preds/n_failed, inicializados antes do loop de CV para o cancelamento
     # parcial reutilizá-los; aqui não são redefinidos (sec 8.2).
-    for series_id in all_series:
+    started_at = time.perf_counter()
+    for idx, series_id in enumerate(all_series, start=1):
         if _cancel_requested(inputs.should_cancel):
             yield _cancelled_event(batch_out, preds, n_failed, total, nodes=nodes_frame)
             return
         series = working.filter(pl.col("series_id") == series_id).sort("ds")
         measure = series["measure"].first()
-        alias = winner_map.get(series_id, "Naive")
-        rows, used_alias, status, fallback_used = _forecast_with_fallback(
-            series,
-            alias,
-            candidates,
-            config,
-            study,
-            inputs.regressors,
-            df_all,
-            entities=inputs.entities,
-        )
-        if not rows:
+        requested = aliases_by_node.get(series_id) or ["Naive"]
+        series_rows = 0
+        series_failed: list[str] = []
+        for m_idx, alias in enumerate(requested, start=1):
+            rows, status = _pkg_attr("forecast_final")(
+                series,
+                alias,
+                config.horizon_periods,
+                study.model_frequency,
+                config,
+                inputs.regressors,
+                df_all=df_all,
+                entities=inputs.entities,
+            )
+            if rows and status == "ok":
+                for r in rows:
+                    preds.append(
+                        {
+                            "node_id": series_id,
+                            "entity_id": series["entity_id"].first(),
+                            "level": "folha",
+                            "measure": measure,
+                            "scenario_id": "base",
+                            "ds": r["ds"],
+                            "yhat": r["yhat"],
+                            "lo80": r["lo80"],
+                            "hi80": r["hi80"],
+                            "model_alias": alias,
+                            "interval_method": r["interval_method"],
+                            "status": PredictionStatus.OK.value,
+                        }
+                    )
+                    series_rows += 1
+            else:
+                series_failed.append(alias)
+            # um evento por modelo concluído: feedback contínuo nas fases lentas
+            # (ex.: AutoTBATS/AutoARIMA), onde a persistência só acontece no fim.
+            yield RunEvent(
+                RunStage.FORECAST,
+                idx,
+                total,
+                _progress_message(
+                    idx,
+                    total,
+                    measure,
+                    alias,
+                    m_idx,
+                    len(requested),
+                    started_at,
+                    ok=bool(rows and status == "ok"),
+                ),
+            )
+            if _cancel_requested(inputs.should_cancel):
+                yield _cancelled_event(
+                    batch_out, preds, n_failed, total, nodes=nodes_frame
+                )
+                return
+        if not series_rows:
             n_failed += 1
             yield RunEvent(
                 RunStage.FORECAST,
-                all_series.index(series_id) + 1,
+                idx,
                 total,
-                f"Série sem previsão ({measure}): {status}.",
+                f"Série sem previsão ({measure}, {idx} de {total}); "
+                f"métodos sem saída: {', '.join(series_failed) or '—'}.",
             )
             continue
-        pred_status = (
-            PredictionStatus.FALLBACK.value
-            if fallback_used
-            else PredictionStatus.OK.value
-        )
-        for r in rows:
-            preds.append(
-                {
-                    "node_id": series_id,
-                    "entity_id": series["entity_id"].first(),
-                    "level": "folha",
-                    "measure": measure,
-                    "scenario_id": "base",
-                    "ds": r["ds"],
-                    "yhat": r["yhat"],
-                    "lo80": r["lo80"],
-                    "hi80": r["hi80"],
-                    "model_alias": used_alias,
-                    "interval_method": r["interval_method"],
-                    "status": pred_status,
-                }
-            )
         yield RunEvent(
             RunStage.FORECAST,
-            all_series.index(series_id) + 1,
+            idx,
             total,
-            f"Previsão final para {measure}.",
+            f"Previsão final para {measure} ({series_rows} valores, "
+            f"{len(requested) - len(series_failed)}/{len(requested)} modelo(s)) "
+            f"— {idx} de {total} séries"
+            + (f"; sem saída: {', '.join(series_failed)}" if series_failed else "")
+            + ".",
         )
 
     if _cancel_requested(inputs.should_cancel):
@@ -347,50 +423,54 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             rows_re = []
             for sid in all_series:
                 base_rows = pred_df.filter(pl.col("node_id") == sid)
-                alias = winner_map.get(sid, "Naive")
-                supports = alias == "AutoARIMA_X" and bool(
-                    inputs.regressors and reg_specs
+                requested = aliases_by_node.get(sid) or ["Naive"]
+                series_ok = all(
+                    base_rows.filter(pl.col("model_alias") == a).height
+                    for a in requested
                 )
-                if not supports:
+                if not series_ok:
                     rows_re.extend(base_rows.to_dicts())
                     continue
                 series = working.filter(pl.col("series_id") == sid).sort("ds")
-                r, used, status, fb_used = _forecast_with_fallback(
-                    series,
-                    alias,
-                    candidates,
-                    config,
-                    study,
-                    inputs.regressors,
-                    df_all,
-                    entities=inputs.entities,
-                    override=sc.regressor_future_overrides,
-                )
-                if not r:
-                    rows_re.extend(base_rows.to_dicts())
-                    continue
-                pstatus = (
-                    PredictionStatus.FALLBACK.value
-                    if fb_used
-                    else PredictionStatus.OK.value
-                )
-                for rr in r:
-                    rows_re.append(
-                        {
-                            "node_id": sid,
-                            "entity_id": series["entity_id"].first(),
-                            "level": "folha",
-                            "measure": series["measure"].first(),
-                            "scenario_id": "base",
-                            "ds": rr["ds"],
-                            "yhat": rr["yhat"],
-                            "lo80": rr["lo80"],
-                            "hi80": rr["hi80"],
-                            "model_alias": used,
-                            "interval_method": rr["interval_method"],
-                            "status": pstatus,
-                        }
+                for alias in requested:
+                    base_alias_rows = base_rows.filter(pl.col("model_alias") == alias)
+                    supports = alias == "AutoARIMA_X" and bool(
+                        inputs.regressors and reg_specs
                     )
+                    if not supports:
+                        rows_re.extend(base_alias_rows.to_dicts())
+                        continue
+                    r, status = _pkg_attr("forecast_final")(
+                        series,
+                        alias,
+                        config.horizon_periods,
+                        study.model_frequency,
+                        config,
+                        inputs.regressors,
+                        df_all=df_all,
+                        entities=inputs.entities,
+                        future_overrides=sc.regressor_future_overrides,
+                    )
+                    if not r or status != "ok":
+                        rows_re.extend(base_alias_rows.to_dicts())
+                        continue
+                    for rr in r:
+                        rows_re.append(
+                            {
+                                "node_id": sid,
+                                "entity_id": series["entity_id"].first(),
+                                "level": "folha",
+                                "measure": series["measure"].first(),
+                                "scenario_id": "base",
+                                "ds": rr["ds"],
+                                "yhat": rr["yhat"],
+                                "lo80": rr["lo80"],
+                                "hi80": rr["hi80"],
+                                "model_alias": alias,
+                                "interval_method": rr["interval_method"],
+                                "status": PredictionStatus.OK.value,
+                            }
+                        )
             return pl.DataFrame(rows_re, schema=pred_df.schema) if rows_re else pred_df
 
         scenario_df, scenario_issues, scenario_factors = generate_scenario_predictions(
@@ -412,12 +492,13 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             payload={"n_scenario_predictions": scenario_df.height},
         )
     if node_mode in ("bottom_up", "mintrace") and node_meta:
+        agg_before = pred_df.height
         pred_df = reconcile_bottom_up(pred_df, hierarchy, node_meta)
         if node_mode == "mintrace":
             pred_df = pred_df.with_columns(
-                pl.when(pl.col("model_alias") == "BottomUp")
-                .then(pl.lit("MinT"))
-                .otherwise(pl.col("model_alias"))
+                pl.when(pl.col("status") == "partial_coverage")
+                .then(pl.col("model_alias"))
+                .otherwise(pl.lit("MinT"))
                 .alias("model_alias")
             )
         n_total_predictions = pred_df.height
@@ -444,4 +525,3 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             "nodes": nodes_frame,
         },
     )
-

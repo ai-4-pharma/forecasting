@@ -45,6 +45,25 @@ def _season_length(freq: SourceFrequency) -> int:
     return 1
 
 
+def _effective_season_length(config, freq: SourceFrequency) -> int:
+    """Ciclo sazonal efetivo: escolha do usuário (`config.season_length`) ou
+    o padrão da frequência (`_season_length`).
+
+    `None`/`0`/inválido caem no padrão — nunca devolve ciclo < 1.
+    """
+    try:
+        sl = getattr(config, "season_length", None)
+    except Exception:  # noqa: BLE001
+        sl = None
+    if sl is None:
+        return _season_length(freq)
+    try:
+        sl = int(sl)
+    except Exception:  # noqa: BLE001
+        return _season_length(freq)
+    return sl if sl >= 1 else _season_length(freq)
+
+
 def _freq_from_windows(
     windows: list[CVWindow], default: SourceFrequency = SourceFrequency.MONTHLY
 ) -> SourceFrequency:
@@ -78,4 +97,3 @@ def _add_period(d: dt.date, freq: SourceFrequency, k: int) -> dt.date:
 
 def _gen_future_dates(last_ds: dt.date, freq: SourceFrequency, h: int) -> list[dt.date]:
     return [_add_period(last_ds, freq, i) for i in range(1, h + 1)]
-

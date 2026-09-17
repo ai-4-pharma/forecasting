@@ -7,6 +7,10 @@ reexportados aqui.
 
 from contracts import stable_id
 
+from ._quiet import install_warning_filters, quiet_native
+
+install_warning_filters()
+
 from .const import (
     MODEL_ORDER,
     RANK_BY_ALIAS,
@@ -19,6 +23,7 @@ from .dates import (
     _freq_str,
     _pd_freq_str,
     _season_length,
+    _effective_season_length,
     _freq_from_windows,
     _add_period,
     _gen_future_dates,
@@ -28,8 +33,6 @@ from .metrics import (
     _mse_mae,
     _apply_floor,
     _score_from_evals,
-    _select_winner,
-    select_models,
     _empty_pred,
     _empty_cv,
     _empty_scores,
@@ -40,16 +43,13 @@ from .models import (
     model_label,
     _make_spec,
     build_candidates,
-    _first_pred_value,
     _extract_yhat,
-    _fc_model_type,
     _sf_n_jobs,
     _build_sf_model,
 )
 
 from .regressors import (
     _regressor_family_conflicts,
-    build_future_regressors,
     validate_regressors,
     _pearson,
     _entity_dims,
@@ -83,8 +83,6 @@ from .hierarchy import (
 from .cv import (
     build_cv_windows,
     _default_cv_horizon,
-    _extract_series,
-    _add_cutoff_date,
     evaluate_candidates,
     _largest_h,
     _run_folds,

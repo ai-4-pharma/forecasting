@@ -5,7 +5,6 @@ Parte do pacote forecast_engine (fatiado do single-file).
 
 from __future__ import annotations
 
-import datetime as dt
 import polars as pl
 
 from contracts import (
@@ -19,18 +18,16 @@ from .dates import _pd_freq_str, _season_length
 from .metrics import _apply_floor
 
 
-
 def _pkg_attr(name: str):
     """Lookup tardio no namespace do pacote (honra monkeypatch)."""
     import forecast_engine as _pkg
+
     return getattr(_pkg, name)
+
 
 # ---------------------------------------------------------------------------
 # Aprendizado global (P28/P29)
 # ---------------------------------------------------------------------------
-
-ML_MIN_ENTITIES = 20
-ML_MIN_ROWS = 200
 
 
 def _ml_available() -> bool:
@@ -89,9 +86,9 @@ def train_global_model(
             return None, "ml_not_installed"
     elif not _pkg_attr("_ml_available")():
         return None, "ml_not_installed"
-    import warnings
+    from ._quiet import install_warning_filters
 
-    warnings.filterwarnings("ignore")
+    install_warning_filters()
     from mlforecast import MLForecast
     from mlforecast.lag_transforms import RollingMean
 
@@ -206,4 +203,3 @@ def ml_final(
             }
         )
     return rows, "ok"
-

@@ -16,6 +16,12 @@ venv/
 exports/
 uploads/
 .cache/
+.pytest_cache/
+.ruff_cache/
+
+# Artefatos de desenvolvimento (suíte de testes, mocks, benchmarks, sondas).
+# Nao fazem parte do produto entregue; ficam fora do versionamento.
+dev/
 
 # IDE / SO
 .idea/
@@ -36,8 +42,8 @@ build/
 dist/
 
 
-# Documentos diversos
-_plan.md
-_plan_opus.md
-logs.txt
+# IDE
 .claude
+
+
+20260917_ajustes.md

@@ -59,7 +59,7 @@ def build_candidates(profile, study, config: ForecastConfig) -> list[ModelSpec]:
     add("MediaMovel6", baseline=True, min_train=6, params={"window": 6})
     add("MediaMovel12", baseline=True, min_train=12, params={"window": 12})
     add("HistoricAverage", baseline=True, min_train=3)
-    if interval_req:
+    if interval_req and candidates and candidates[-1].alias == "HistoricAverage":
         candidates[-1].supports_intervals = True
 
     if study.source_frequency in (SourceFrequency.MONTHLY, SourceFrequency.QUARTERLY):
@@ -103,13 +103,6 @@ def build_candidates(profile, study, config: ForecastConfig) -> list[ModelSpec]:
     return candidates
 
 
-def _first_pred_value(row: dict) -> float:
-    for v in row.values():
-        if isinstance(v, float) or isinstance(v, int):
-            return float(v)
-    return 0.0
-
-
 def _extract_yhat(row: dict, alias: str) -> float:
     """Extrai a previsão pontual da linha devolvida pelo StatsForecast."""
     for key in (alias, "AutoETS", "unique_id"):
@@ -125,19 +118,16 @@ def _extract_yhat(row: dict, alias: str) -> float:
     return 0.0
 
 
-def _fc_model_type(model) -> str:
-    return type(model).__name__
-
-
 def _sf_n_jobs(config=None) -> int:
-    """Paralelismo do StatsForecast entre séries (usa os 8 núcleos)."""
+    """Paralelismo do StatsForecast entre séries. Respeita `config.n_jobs`
+    (default 1; no Windows, pool de processos é caro e mais lento)."""
     import os as _os
 
     try:
         cfg_n = int(getattr(config, "n_jobs", 0) or 0)
     except Exception:  # noqa: BLE001
         cfg_n = 0
-    if cfg_n and cfg_n > 1:
+    if cfg_n >= 1:
         return cfg_n
     return max(1, min(8, _os.cpu_count() or 4))
 
@@ -173,7 +163,11 @@ def _build_sf_model(alias: str, season_len: int):
             approximation=True,
         )
     if alias == "AutoTBATS":
-        return AutoTBATS(season_length=season_len)
+        return AutoTBATS(
+            season_length=season_len,
+            use_boxcox=False,
+            use_arma_errors=False,
+        )
     table = {
         "Naive": Naive,
         "MediaMovel3": lambda: WindowAverage(window_size=3),
@@ -181,13 +175,15 @@ def _build_sf_model(alias: str, season_len: int):
         "MediaMovel12": lambda: WindowAverage(window_size=12),
         "HistoricAverage": HistoricAverage,
         "RegLinearDrift": RandomWalkWithDrift,
+        # Holt/HoltDamped são de tendência: permanecem não-sazonais (ciclo 1).
         "Holt": lambda: Holt(season_length=1),
         "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
+        # CrostonSBA/TSB não aceitam season_length (intermitentes, sem ciclo).
         "CrostonSBA": CrostonSBA,
-        "AutoETS": AutoETS,
-        "ETS_Damped": lambda: AutoETS(damped=True),
-        "AutoTheta": AutoTheta,
-        "AutoCES": AutoCES,
+        "AutoETS": lambda: AutoETS(season_length=season_len),
+        "ETS_Damped": lambda: AutoETS(season_length=season_len, damped=True),
+        "AutoTheta": lambda: AutoTheta(season_length=season_len),
+        "AutoCES": lambda: AutoCES(season_length=season_len),
     }
     if alias == "TSB":
         return TSB(alpha_d=0.2, alpha_p=0.2)
@@ -195,4 +191,3 @@ def _build_sf_model(alias: str, season_len: int):
     if factory is None:
         return None
     return factory() if callable(factory) else factory
-

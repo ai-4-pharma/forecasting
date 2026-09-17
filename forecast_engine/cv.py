@@ -5,7 +5,6 @@ Parte do pacote forecast_engine (fatiado do single-file).
 
 from __future__ import annotations
 
-import datetime as dt
 import numpy as np
 import polars as pl
 
@@ -19,10 +18,24 @@ from contracts import (
     MIN_INTERMITTENT_POSITIVES,
 )
 
-from .dates import _add_period, _freq_from_windows, _freq_str, _season_length
-from .metrics import _apply_floor, _empty_cv, _empty_pred, _empty_scores, _empty_select, _mse_mae, _score_from_evals, _select_winner
+from .dates import (
+    _add_period,
+    _effective_season_length,
+    _freq_from_windows,
+    _freq_str,
+)
+from .metrics import (
+    _apply_floor,
+    _empty_cv,
+    _empty_pred,
+    _empty_scores,
+    _empty_select,
+    _mse_mae,
+    _score_from_evals,
+)
 from .models import _build_sf_model, _extract_yhat, _sf_n_jobs
 from .regressors import _run_regressor_folds
+from ._quiet import quiet_native
 
 
 def build_cv_windows(data, study, config: ForecastConfig) -> list[CVWindow]:
@@ -85,16 +98,6 @@ def _default_cv_horizon(study, horizon: int) -> int:
 # ---------------------------------------------------------------------------
 # Avaliação temporal e seleção (P16/P17)
 # ---------------------------------------------------------------------------
-
-
-def _extract_series(df: pl.DataFrame, series_id: str, measure: str) -> pl.DataFrame:
-    return df.filter(
-        pl.col("series_id") == series_id, pl.col("measure") == measure
-    ).sort("ds")
-
-
-def _add_cutoff_date(series: pl.DataFrame, cutoff: dt.date) -> pl.DataFrame:
-    return series.filter(pl.col("ds") <= cutoff)
 
 
 def evaluate_candidates(
@@ -174,7 +177,7 @@ def evaluate_candidates(
     # Pass 2 vetorizado: 1 StatsForecast por (modelo, fold) com todas as
     # séries elegíveis + n_jobs entre séries (ganho 10-50x vs 1 fit/série).
     freq_cv = _freq_from_windows(windows)
-    season_cv = _season_length(freq_cv)
+    season_cv = _effective_season_length(config, freq_cv)
     njobs = _sf_n_jobs(config)
     VECTOR_OK = {
         a
@@ -212,6 +215,7 @@ def evaluate_candidates(
                     measure=m,
                     node_id=sid,
                     entities=entities,
+                    config=config,
                 )
                 for cv in eval_per_fold:
                     panel_evals.setdefault((sid, m, alias), []).append(cv)
@@ -306,6 +310,7 @@ def evaluate_candidates(
                     measure=measure,
                     node_id=node_id,
                     entities=entities,
+                    config=config,
                 )
             for cv in eval_per_fold:
                 cv_rows.append(cv)
@@ -328,7 +333,6 @@ def evaluate_candidates(
                 "n_folds": n_windows,
                 "eligible": True,
             }
-        winner, reason, fallback = _select_winner(scores_raw, eligible_aliases)
         for alias in scores_raw:
             s = scores_raw[alias]
             score_rows.append(
@@ -346,18 +350,24 @@ def evaluate_candidates(
                     "failure_reason": "" if s else "no_evaluable_folds",
                 }
             )
-        selec_rows.append(
-            {
-                "node_id": node_id,
-                "measure": measure,
-                "model_alias": winner,
-                "selection_reason": reason,
-                "cv_horizon": _largest_h(windows),
-                "n_folds": n_windows,
-                "fallback_used": bool(fallback),
-                "clipped_count": 0,
-            }
-        )
+        for alias in eligible_aliases:
+            s = scores_raw.get(alias)
+            if s is None:
+                # ineligible or no_evaluable_folds already recorded in scores;
+                # sem eleição de vencedor (decisão do usuário), não há seleção única.
+                continue
+            selec_rows.append(
+                {
+                    "node_id": node_id,
+                    "measure": measure,
+                    "model_alias": alias,
+                    "selection_reason": "usuario",
+                    "cv_horizon": _largest_h(windows),
+                    "n_folds": n_windows,
+                    "fallback_used": False,
+                    "clipped_count": 0,
+                }
+            )
 
     return ForecastBatch(
         predictions=pl.DataFrame(pred_rows or _empty_pred()),
@@ -384,11 +394,12 @@ def _run_folds(
     measure: str,
     node_id: str,
     entities=None,
+    config: ForecastConfig | None = None,
 ):
     """Roda folds para um candidato/série; devolve (preds, eval) alinhados."""
     if alias == "AutoARIMA_X":
         return _run_regressor_folds(
-            series, regressors, entities, windows, node_id, measure
+            series, regressors, entities, windows, node_id, measure, config=config
         )
     from statsforecast import StatsForecast
     from statsforecast.models import (
@@ -403,34 +414,37 @@ def _run_folds(
         AutoARIMA,
         AutoTBATS,
         WindowAverage,
-        SeasonalWindowAverage,
         RandomWalkWithDrift,
         Holt,
-        HoltWinters,
     )
 
     def _window(w: int):
         return lambda: WindowAverage(window_size=w)
 
+    # mapa local de reserva (usado apenas se a fábrica não cobrir o alias)
     model_map = {
         "Naive": lambda: Naive(),
         "MediaMovel3": _window(3),
         "MediaMovel6": _window(6),
         "MediaMovel12": _window(12),
         "HistoricAverage": lambda: HistoricAverage(),
-        "SeasonalNaive": lambda: SeasonalNaive(season_length=12),
+        "SeasonalNaive": lambda: SeasonalNaive(season_length=season_len),
         "RegLinearDrift": lambda: RandomWalkWithDrift(),
         "Holt": lambda: Holt(season_length=1),
         "HoltDamped": lambda: AutoETS(model="AAdN", damped=True),
         "CrostonSBA": lambda: CrostonSBA(),
         "TSB": lambda: TSB(alpha_d=0.2, alpha_p=0.2),
-        "AutoETS": lambda: AutoETS(),
-        "ETS_Damped": lambda: AutoETS(damped=True),
-        "AutoTheta": lambda: AutoTheta(),
-        "AutoCES": lambda: AutoCES(),
-        "AutoTBATS": lambda: AutoTBATS(season_length=12),
+        "AutoETS": lambda: AutoETS(season_length=season_len),
+        "ETS_Damped": lambda: AutoETS(season_length=season_len, damped=True),
+        "AutoTheta": lambda: AutoTheta(season_length=season_len),
+        "AutoCES": lambda: AutoCES(season_length=season_len),
+        "AutoTBATS": lambda: AutoTBATS(
+            season_length=season_len,
+            use_boxcox=False,
+            use_arma_errors=False,
+        ),
         "AutoARIMA": lambda: AutoARIMA(
-            season_length=12,
+            season_length=season_len,
             max_p=3,
             max_q=3,
             max_P=1,
@@ -441,6 +455,11 @@ def _run_folds(
     }
     if alias == "ZeroBaseline":
         return _zero_baseline(series, windows, node_id, measure)
+    freq = _freq_from_windows(windows)
+    season_len = _effective_season_length(config, freq)
+    # fábrica única (mesma do painel vetorizado): garante ciclo e parâmetros iguais
+    if _build_sf_model(alias, season_len) is not None:
+        model_map[alias] = lambda: _build_sf_model(alias, season_len)
     if alias not in model_map:
         return [], []
     eval_rows: list[dict] = []
@@ -450,20 +469,6 @@ def _run_folds(
         trained_inputs = data.prepared
     else:
         trained_inputs = data
-    freq = _freq_from_windows(windows)
-    season_len = _season_length(freq)
-    if alias == "SeasonalNaive":
-        model_map["SeasonalNaive"] = lambda: SeasonalNaive(season_length=season_len)
-    if alias == "AutoARIMA":
-        model_map["AutoARIMA"] = lambda: AutoARIMA(
-            season_length=season_len,
-            max_p=3,
-            max_q=3,
-            max_P=1,
-            max_Q=1,
-            max_order=5,
-            approximation=True,
-        )
     for w in windows:
         train = trained_inputs.filter(
             pl.col("series_id") == series_id,
@@ -474,16 +479,17 @@ def _run_folds(
             continue
         mdl = model_map[alias]()
         try:
-            sf = StatsForecast(
-                models=[mdl],
-                freq=_freq_str(freq),
-                n_jobs=1,
-                fallback_model=Naive(),
-            )
-            df = train.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
-                ["unique_id", "ds", "y"]
-            ]
-            fc = sf.forecast(df=df, h=len(w.eval_dates), level=[80])
+            with quiet_native():
+                sf = StatsForecast(
+                    models=[mdl],
+                    freq=_freq_str(freq),
+                    n_jobs=1,
+                    fallback_model=Naive(),
+                )
+                df = train.rename({"ds": "ds", "y": "y", "series_id": "unique_id"})[
+                    ["unique_id", "ds", "y"]
+                ]
+                fc = sf.forecast(df=df, h=len(w.eval_dates), level=[80])
         except Exception as e:  # noqa: BLE001
             eval_rows.append(
                 {
@@ -571,13 +577,14 @@ def _run_folds_panel(
         if not trains:
             continue
         panel = pl.concat(trains).sort(["unique_id", "ds"])
-        sf = StatsForecast(
-            models=[_build_sf_model(alias, season_len)],
-            freq=freq_str,
-            n_jobs=n_jobs,
-            fallback_model=_Naive(),
-        )
-        fc = sf.forecast(df=panel, h=h, level=[80])
+        with quiet_native():
+            sf = StatsForecast(
+                models=[_build_sf_model(alias, season_len)],
+                freq=freq_str,
+                n_jobs=n_jobs,
+                fallback_model=_Naive(),
+            )
+            fc = sf.forecast(df=panel, h=h, level=[80])
         for row in fc.to_dicts():
             uid = str(row.get("unique_id"))
             ds = row.get("ds")
@@ -639,4 +646,3 @@ def _zero_baseline(series, windows, node_id, measure):
                 }
             )
     return pred_rows, eval_rows
-

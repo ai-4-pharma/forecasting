@@ -34,6 +34,15 @@ if errorlevel 1 (
 )
 
 echo.
+echo Verificando os pacotes...
+python -c "import polars, streamlit, statsforecast, duckdb, openpyxl, plotly, mlforecast, lightgbm, xgboost; print('pacotes ok')"
+if errorlevel 1 (
+    echo.
+    echo AVISO: algum pacote nao foi importado corretamente.
+    echo Veja a mensagem acima antes de usar a aplicacao.
+)
+
+echo.
 echo ============================================
 echo  Instalacao concluida com sucesso!
 echo  Use "iniciar.bat" para abrir o Forecast Community.

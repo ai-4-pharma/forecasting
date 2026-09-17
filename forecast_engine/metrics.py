@@ -8,16 +8,6 @@ from __future__ import annotations
 import datetime as dt
 import math
 import numpy as np
-import polars as pl
-
-from contracts import (
-    ForecastConfig,
-    SelectionReason,
-    SelectionResult,
-    TIE_TOLERANCE,
-)
-
-from .const import RANK_BY_ALIAS
 
 
 # ---------------------------------------------------------------------------
@@ -78,39 +68,6 @@ def _score_from_evals(eval_rows: list[dict], n_windows: int) -> dict:
         "n_folds": n_windows,
         "eligible": True,
     }
-
-
-def _select_winner(
-    scores_raw: dict, eligible_aliases: list[str]
-) -> tuple[str, str, bool]:
-    """Ranking por MAE com tolerância de 1% e fallback (sec 9.3)."""
-    ranked = [a for a in eligible_aliases if scores_raw.get(a)]
-    if not ranked:
-        return "Naive", SelectionReason.FALLBACK.value, True
-    scored = [(scores_raw[a]["mae"], RANK_BY_ALIAS.get(a, 1000), a) for a in ranked]
-    scored.sort(key=lambda t: (math.inf if t[0] is None else t[0], t[1]))
-    best_mae, _, best_alias = scored[0]
-    # tolerância 1%
-    near = [
-        (t[2], t[1])
-        for t in scored
-        if t[0] is not None and t[0] <= best_mae * TIE_TOLERANCE + 1e-12
-    ]
-    near.sort(key=lambda t: t[1])
-    winner = near[0][0]
-    reason = (
-        SelectionReason.BEST_MAE.value
-        if winner == best_alias
-        else SelectionReason.TIE_BREAK.value
-    )
-    return winner, reason, False
-
-
-def select_models(scores, config: ForecastConfig) -> SelectionResult:
-    """Selects por série/medida a partir de frame de scores (P17)."""
-    rows = {"selection": scores, "ranking_notes": {}, "median_n_folds": 0}
-    best = scores.filter(pl.col("eligible") == True)
-    return SelectionResult(best, {}, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -184,4 +141,3 @@ def _empty_select() -> list[dict]:
             "clipped_count": 0,
         }
     ]
-
