@@ -109,112 +109,66 @@ def prepare_data(
     dedup = dedup.with_columns(pl.col("y_raw").cast(pl.Float64).alias("y"))
 
     grid = build_time_grid(study)
-    grid_dates = set(grid)
+    grid_df = pl.DataFrame({"ds": sorted(set(grid))}, schema={"ds": pl.Date})
 
-    # preenchimento de lacunas por série
-    out_rows: list[dict] = []
-    for (series_id, measure, entity_id), grp in dedup.group_by(
-        ["series_id", "measure", "entity_id"]
-    ):
-        present = set(grp["ds"].to_list())
-        vals = {d: v for d, v in zip(grp["ds"].to_list(), grp["y"].to_list())}
-        series_dates = [
-            d for d in grid_dates if d >= min(present, default=date(2020, 1, 1))
-        ]
-        if policy.missing_action == MissingAction.EXCLUDE_SERIES:
-            series_dates = sorted(present)
-            for d in series_dates:
-                out_rows.append(
-                    {
-                        "series_id": series_id,
-                        "ds": d,
-                        "measure": measure,
-                        "entity_id": entity_id,
-                        "y": vals[d],
-                        "observed": True,
-                        "was_adjusted": False,
-                        "adjustment_reason": "",
-                    }
-                )
-        elif policy.missing_action == MissingAction.FFILL:
-            prev = None
-            for d in series_dates:
-                if d in vals:
-                    prev = vals[d]
-                    out_rows.append(
-                        {
-                            "series_id": series_id,
-                            "ds": d,
-                            "measure": measure,
-                            "entity_id": entity_id,
-                            "y": vals[d],
-                            "observed": True,
-                            "was_adjusted": False,
-                            "adjustment_reason": "",
-                        }
-                    )
-                elif prev is not None:
-                    out_rows.append(
-                        {
-                            "series_id": series_id,
-                            "ds": d,
-                            "measure": measure,
-                            "entity_id": entity_id,
-                            "y": prev,
-                            "observed": False,
-                            "was_adjusted": True,
-                            "adjustment_reason": "ffill",
-                        }
-                    )
-                else:
-                    continue
-        elif policy.missing_action == MissingAction.ZERO:
-            for d in series_dates:
-                if d in vals:
-                    out_rows.append(
-                        {
-                            "series_id": series_id,
-                            "ds": d,
-                            "measure": measure,
-                            "entity_id": entity_id,
-                            "y": vals[d],
-                            "observed": True,
-                            "was_adjusted": False,
-                            "adjustment_reason": "",
-                        }
-                    )
-                else:
-                    out_rows.append(
-                        {
-                            "series_id": series_id,
-                            "ds": d,
-                            "measure": measure,
-                            "entity_id": entity_id,
-                            "y": 0.0,
-                            "observed": False,
-                            "was_adjusted": True,
-                            "adjustment_reason": "zero_preenchido",
-                        }
-                    )
-        else:
-            # exclude_series com séries completas mantidas (fallback para valores
-            # ainda não mapeados em política conhecida)
-            for d in sorted(present):
-                out_rows.append(
-                    {
-                        "series_id": series_id,
-                        "ds": d,
-                        "measure": measure,
-                        "entity_id": entity_id,
-                        "y": vals[d],
-                        "observed": True,
-                        "was_adjusted": False,
-                        "adjustment_reason": "",
-                    }
-                )
+    # preenchimento de lacunas vetorizado (S1.5): grade por série via cross join
+    # + join left com o observado, política aplicada por expressão (sem loop
+    # Python por série/data).
+    series_bounds = dedup.group_by(["series_id", "measure", "entity_id"]).agg(
+        pl.col("ds").min().alias("_min_ds")
+    )
+    full = (
+        series_bounds.join(grid_df, how="cross")
+        .filter(pl.col("ds") >= pl.col("_min_ds"))
+        .join(
+            dedup.select(["series_id", "measure", "entity_id", "ds", "y"]),
+            on=["series_id", "measure", "entity_id", "ds"],
+            how="left",
+        )
+        .drop("_min_ds")
+    )
 
-    # negaivos / outliers / winsorização
-    prepped = pl.DataFrame(out_rows).with_columns(
+    if policy.missing_action == MissingAction.FFILL:
+        prepped = (
+            full.sort(["series_id", "measure", "entity_id", "ds"])
+            .with_columns(pl.col("y").is_not_null().alias("observed"))
+            .with_columns(
+                pl.col("y")
+                .forward_fill()
+                .over(["series_id", "measure", "entity_id"])
+                .alias("y")
+            )
+            .filter(pl.col("y").is_not_null())
+            .with_columns(
+                (~pl.col("observed")).alias("was_adjusted"),
+                pl.when(pl.col("observed"))
+                .then(pl.lit(""))
+                .otherwise(pl.lit("ffill"))
+                .alias("adjustment_reason"),
+            )
+        )
+    elif policy.missing_action == MissingAction.ZERO:
+        prepped = full.with_columns(
+            pl.col("y").is_not_null().alias("observed"),
+            pl.col("y").is_null().alias("was_adjusted"),
+            pl.when(pl.col("y").is_not_null())
+            .then(pl.lit(""))
+            .otherwise(pl.lit("zero_preenchido"))
+            .alias("adjustment_reason"),
+        ).with_columns(pl.col("y").fill_null(0.0))
+    else:
+        # EXCLUDE_SERIES (e fallback para política desconhecida): só datas
+        # efetivamente observadas, sem preenchimento.
+        prepped = full.filter(pl.col("y").is_not_null()).with_columns(
+            pl.lit(True).alias("observed"),
+            pl.lit(False).alias("was_adjusted"),
+            pl.lit("").alias("adjustment_reason"),
+        )
+
+    prepped = prepped.select(
+        "series_id", "ds", "measure", "entity_id", "y", "observed", "was_adjusted",
+        "adjustment_reason",
+    ).with_columns(
         pl.col("y").cast(pl.Float64),
         pl.when(pl.col("y").is_null())
         .then(pl.lit(False))

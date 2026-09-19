@@ -124,6 +124,8 @@ def _empty_scores() -> list[dict]:
             "n_folds": 0,
             "eligible": False,
             "failure_reason": "",
+            "selected": False,
+            "selection_reason": "",
         }
     ]
 

@@ -9,7 +9,19 @@ import io
 import re
 import polars as pl
 import openpyxl
-from contracts import FileInspection, MAX_FILE_BYTES, MAX_PHYSICAL_ROWS, MappingConfig, Severity, ValidationIssue, empty_long
+from contracts import (
+    FileInspection,
+    Layout,
+    MAX_FILE_BYTES,
+    MAX_PHYSICAL_ROWS,
+    MappingConfig,
+    Severity,
+    SourceFrequency,
+    StudyConfig,
+    ValidationIssue,
+    empty_long,
+)
+from .dates import _parse_period_col
 
 
 
@@ -88,6 +100,55 @@ def suggest_time_settings(
     else:
         frequency = "yearly"
     return {"history_end": dates[-1], "n_periods": len(dates), "frequency": frequency}
+def autodetect_mapping(
+    insp: FileInspection, name: str = "Detectado automaticamente"
+) -> tuple[StudyConfig, MappingConfig] | None:
+    """Detecta mapeamento largo tipo N05A sem perguntar nada ao usuário (S2.2):
+    colunas cujo cabeçalho passa em `_parse_period_col` viram `wide_period_map`;
+    as demais, na ordem original, viram dimensões (`key_columns`/`dimension_columns`).
+    Frequência e último período fechado vêm de `suggest_time_settings`. Recusa
+    (`None`) com menos de 12 períodos ou nenhuma dimensão, para o chamador cair
+    no formulário de mapeamento manual (`POST /datasets/manual`, S2.2 ação 2).
+    """
+    period_map: dict[str, str] = {}
+    dim_cols: list[str] = []
+    for col in insp.columns:
+        iso = _parse_period_col(col)
+        if iso:
+            period_map[col] = iso
+        else:
+            dim_cols.append(col)
+    if len(period_map) < 12 or not dim_cols:
+        return None
+
+    settings = suggest_time_settings(insp.sample, None, list(period_map.values()))
+    frequency = {
+        "monthly": SourceFrequency.MONTHLY,
+        "quarterly": SourceFrequency.QUARTERLY,
+        "yearly": SourceFrequency.YEARLY,
+    }.get(settings.get("frequency"), SourceFrequency.MONTHLY)
+
+    study = StudyConfig(
+        name=name,
+        layout=Layout.WIDE,
+        dimension_names=list(dim_cols),
+        analysis_level=dim_cols[-1],
+        source_frequency=frequency,
+        model_frequency=frequency,
+        measures=["unidades"],
+        history_end=settings.get("history_end"),
+        history_periods=len(period_map),
+    )
+    mapping = MappingConfig(
+        key_columns=list(dim_cols),
+        dimension_columns={c: c for c in dim_cols},
+        measure_columns={"unidades": "unidades"},
+        wide_period_map=period_map,
+        key_json_order=list(dim_cols),
+    )
+    return study, mapping
+
+
 def inspect_file(
     content: bytes, filename: str, options: MappingConfig
 ) -> FileInspection:

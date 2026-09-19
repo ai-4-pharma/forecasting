@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Análise de Projeção</title>
+  <link rel="stylesheet" href="vendor/ag-grid.min.css">
+  <link rel="stylesheet" href="vendor/ag-theme-alpine.min.css">
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/echarts.min.js"></script>
+  <script src="vendor/ag-grid-community.min.js"></script>
+</head>
+
+<body>
+  <div class="shell" x-data="app()">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <img class="brand-logo" src="ia_farma.png" alt="ai4pharma">
+      </div>
+      <h1 class="brand-title">Forecasting Tool</h1>
+      <div class="topbar-right">
+        <button class="secondary theme-toggle" type="button" @click="toggleTheme()"
+          :title="theme === 'dark' ? 'Mudar para tema claro' : 'Mudar para tema escuro'">
+          <span x-text="theme === 'dark' ? '☀ Claro' : '🌙 Escuro'"></span>
+        </button>
+        <span class="status-chip" :class="statusClass" x-text="statusText"></span>
+      </div>
+    </header>
+
+    <div class="processing-overlay" x-show="running" style="display:none">
+      <div class="gear-spin">⚙</div>
+      <div class="processing-log">
+        <template x-for="(entry, idx) in progressLog" :key="entry.id">
+          <div class="log-line" :style="'opacity:' + Math.max(0.15, 1 - (progressLog.length - 1 - idx) * 0.18)"
+            x-text="entry.message"></div>
+        </template>
+      </div>
+      <div class="processing-bar" x-show="progressTotal > 0">
+        <div class="processing-bar-fill" :style="'width:' + progressPct() + '%'"></div>
+      </div>
+    </div>
+
+    <aside class="tree-pane">
+      <div class="side-controls">
+        <div class="side-study-row">
+          <button class="secondary" type="button" @click="newStudy()" :disabled="running"
+            title="Volta para a tela inicial limpa para uma nova projeção">Novo estudo</button>
+          <button class="secondary" type="button" @click="openStudiesDialog()" :disabled="running"
+            title="Abre um estudo já rodado e salvo no banco">Abrir estudo</button>
+        </div>
+        <div class="study-card" x-show="currentStudy && tree">
+          <div class="study-card-name"
+            x-text="currentStudy && currentStudy.saved ? currentStudy.name : 'Estudo não salvo'"></div>
+          <div class="study-card-meta"
+            x-text="currentStudy ? `ID ${currentStudy.short_id} · rodou em ${fmtDateTime(currentStudy.started_at)}` : ''">
+          </div>
+          <button class="secondary study-save-btn" type="button" @click="openSaveDialog()" x-show="!running"
+            x-text="currentStudy && currentStudy.saved ? 'Renomear estudo' : 'Salvar estudo'"></button>
+        </div>
+        <input type="file" x-ref="fileInput" accept=".csv,.xlsx" style="display:none" @change="onFileSelected($event)">
+        <button @click="$refs.fileInput.click()">Abrir arquivo</button>
+        <span class="dataset-label" x-text="datasetLabel" :title="datasetLabel"></span>
+        <span class="dataset-label" x-show="qualitySummary" x-text="qualitySummary"></span>
+        <label>Horizonte
+          <input type="number" x-model.number="horizon" min="1" max="24" style="width:4em">
+        </label>
+        <div class="side-methods">
+          <button class="secondary" @click="toggleModelsPanel($event)" type="button">
+            Métodos <span x-text="selectedModels.length ? `(${selectedModels.length})` : '(automático)'"></span>
+          </button>
+          <div class="models-panel" x-ref="modelsPanel" :style="modelsPanelStyle" x-show="modelsPanelOpen"
+            @click.outside="modelsPanelOpen = false; slowHintAlias = null">
+            <div class="models-panel-hint">
+              Escolha até 5 métodos para comparar. Sem seleção, o sistema escolhe o melhor por item.
+            </div>
+            <div class="models-panel-group-label">Núcleo</div>
+            <template x-for="alias in availableModels.core" :key="alias">
+              <label class="models-panel-option">
+                <input type="checkbox" :value="alias" @change="toggleModel(alias)"
+                  :checked="selectedModels.includes(alias)"
+                  :disabled="!selectedModels.includes(alias) && selectedModels.length >= 5">
+                <span x-text="alias"></span>
+              </label>
+            </template>
+            <div class="models-panel-group-label" style="margin-top:10px;">Avançado</div>
+            <template x-for="alias in availableModels.advanced" :key="alias">
+              <label class="models-panel-option" @mouseenter="showSlowHint(alias, $event)"
+                @mouseleave="slowHintAlias = null">
+                <input type="checkbox" :value="alias" @change="toggleModel(alias)"
+                  :checked="selectedModels.includes(alias)"
+                  :disabled="!selectedModels.includes(alias) && selectedModels.length >= 5">
+                <span x-text="alias"></span>
+                <span x-show="isSlowModel(alias)" class="models-panel-slow-badge">⏱</span>
+                <div class="models-panel-slow-popup" :style="slowHintStyle" x-show="slowHintAlias === alias"
+                  x-text="availableModels.slow_hint"></div>
+              </label>
+            </template>
+            <div class="models-panel-limit" x-show="selectedModels.length >= 5">
+              Máximo de 5 métodos.
+            </div>
+          </div>
+        </div>
+        <div class="side-actions">
+          <button @click="startRun()" :disabled="!datasetId || running">Gerar</button>
+          <a class="button secondary" :class="{disabled: !tree || running}"
+            :href="tree && !running ? `/runs/${runId}/export.xlsx` : null" download
+            title="Baixa o histórico e uma aba por método rodado">Exportar Excel</a>
+        </div>
+      </div>
+      <div class="side-divider">Filtros</div>
+      <input type="search" placeholder="Buscar…" x-model="treeFilter">
+      <template x-if="!tree">
+        <div class="empty-state">Carregue um arquivo e clique em Gerar para ver a árvore.</div>
+      </template>
+      <template x-if="tree">
+        <div class="cascade">
+          <template x-for="level in cascadeLevels()" :key="level.dim">
+            <div class="cascade-level">
+              <label class="cascade-label" x-text="level.dim"></label>
+              <select multiple :size="Math.max(3, Math.min(8, level.options.length))"
+                @change="onLevelChange(level, $event)">
+                <template x-for="opt in level.options" :key="opt._path">
+                  <option :value="opt._path" :selected="isSelected(opt)" x-text="opt.name + ' (' + opt.n_series + ')'">
+                  </option>
+                </template>
+              </select>
+            </div>
+          </template>
+          <div class="selected-chips" x-show="selectedItems.length">
+            <template x-for="node in selectedItems" :key="node._path">
+              <span class="chip" :class="{active: selected && selected.dim===node.dim && selected.value===node.name}"
+                @click="toggleItem(node)" :title="'Remover ' + node.name">
+                <span x-text="node.name"></span> &times;
+              </span>
+            </template>
+          </div>
+        </div>
+      </template>
+    </aside>
+
+    <main class="chart-pane" style="position:relative;display:flex;flex-direction:column;">
+      <div class="chart-tabs" x-show="series">
+        <button type="button" :class="{active: activeTab===1}" @click="switchTab(1)">Projeção do item</button>
+        <button type="button" :class="{active: activeTab===2}" @click="switchTab(2)">Comparar métodos</button>
+        <button type="button" :class="{active: activeTab===3}" @click="switchTab(3)">Comparar itens</button>
+        <label class="tab3-model" x-show="activeTab===3">
+          Método
+          <select x-model="multiModel" @change="onMultiModelChange()">
+            <template x-for="alias in tab3ModelOptions()" :key="alias">
+              <option :value="alias" x-text="alias"></option>
+            </template>
+          </select>
+        </label>
+      </div>
+      <div style="position:relative;flex:1;min-height:0;">
+        <div class="empty-state" x-show="!series"
+          style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+          Selecione um nó na árvore para ver o gráfico.
+        </div>
+        <div class="empty-state" x-show="series && activeTab===2 && (!compareData || !compareData.models.length)"
+          style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+          Nenhum outro método para comparar neste item.
+        </div>
+        <div class="empty-state" x-show="series && activeTab===3 && !multiSeries.length"
+          style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+          Marque mais itens na árvore à esquerda para comparar.
+        </div>
+        <!-- Nunca fica display:none: ECharts calcula o tamanho do canvas no
+           momento do init() e não se recupera bem de um container 0x0
+           (x-show escondendo esta div causava um gráfico "encolhido" mesmo
+           depois de chart.resize() na 1ª série carregada). As abas trocam só
+           o conteúdo desenhado (setOption), nunca este container. -->
+        <div x-ref="chartEl" id="chart"></div>
+      </div>
+    </main>
+
+    <aside class="kpi-pane">
+      <div class="kpi-card" title="Soma dos últimos 12 meses observados no histórico (não inclui projeção).">
+        <div class="kpi-label">Último MAT</div>
+        <div class="kpi-value" x-text="fmt(series && series.kpis.mat)"></div>
+        <div class="kpi-hint" x-text="matHint()"></div>
+      </div>
+      <div class="kpi-card" title="Compara o último MAT com o MAT de 12 meses antes.">
+        <div class="kpi-label">Variação MAT (YoY)</div>
+        <div class="kpi-value" x-text="series ? fmtPct(series.kpis.yoy) : 'N/D'"></div>
+        <div class="kpi-hint">Último MAT contra o MAT de 12 meses antes.<template
+            x-if="series && series.kpis.yoy === null"> Precisa de 24 meses de histórico.</template></div>
+      </div>
+      <div class="kpi-card" x-show="series && series.kpis.cagr !== null"
+        title="Crescimento médio por ano, composto, entre o primeiro e o último bloco de 12 meses do histórico.">
+        <div class="kpi-label">CAGR do MAT</div>
+        <div class="kpi-value" x-text="series ? fmtPct(series.kpis.cagr) : 'N/D'"></div>
+        <div class="kpi-hint"
+          x-text="series && series.kpis.cagr !== null ? `Crescimento médio ao ano em ${series.kpis.cagr_years} anos (1º ao último MAT).` : ''">
+        </div>
+      </div>
+      <div class="kpi-card"
+        title="Soma dos valores projetados para todos os meses do horizonte, com o método de referência do item.">
+        <div class="kpi-label">Total projetado no horizonte</div>
+        <div class="kpi-value" x-text="fmt(series && series.kpis.total_h)"></div>
+        <div class="kpi-hint" x-text="series ? `Soma da projeção dos próximos ${series.kpis.horizon_n} meses.` : ''">
+        </div>
+      </div>
+      <div class="kpi-card"
+        title="Backtest: o método prevê meses passados que já conhecemos e a previsão é comparada com o valor real.">
+        <div class="kpi-label">Erro do método (WAPE)</div>
+        <div class="kpi-value" x-text="series ? fmtPct(series.kpis.wape) : 'N/D'"></div>
+        <div class="kpi-hint">Erro médio em % do volume real, medido em meses passados (backtest). Quanto menor, melhor:
+          20% = errou, em média, 20% do volume.</div>
+      </div>
+      <div class="kpi-card"
+        title="Erro médio com sinal: positivo = o método tende a superestimar; negativo = subestimar.">
+        <div class="kpi-label">Viés do método (Bias)</div>
+        <div class="kpi-value" x-text="fmt(series && series.kpis.bias)"></div>
+        <div class="kpi-hint">Erro médio por mês (previsto − real), em unidades, no backtest. Positivo = superestima;
+          negativo = subestima; perto de 0 = sem tendência.</div>
+      </div>
+
+      <div class="kpi-section" x-show="series && series.kpis.stats">
+        Estatísticas do histórico
+        <span class="kpi-section-sub"
+          x-text="series && series.kpis.stats ? `${series.kpis.stats.n} valores mensais observados` : ''"></span>
+      </div>
+      <template x-if="series && series.kpis.stats">
+        <div class="kpi-stats">
+          <div class="kpi-card" title="Maior valor mensal do histórico.">
+            <div class="kpi-label">Máxima</div>
+            <div class="kpi-value kpi-value-sm" x-text="fmt(series.kpis.stats.max)"></div>
+            <div class="kpi-hint" x-text="fmtMonth(series.kpis.stats.max_ds)"></div>
+          </div>
+          <div class="kpi-card" title="Menor valor mensal do histórico.">
+            <div class="kpi-label">Mínima</div>
+            <div class="kpi-value kpi-value-sm" x-text="fmt(series.kpis.stats.min)"></div>
+            <div class="kpi-hint" x-text="fmtMonth(series.kpis.stats.min_ds)"></div>
+          </div>
+          <div class="kpi-card"
+            title="Quanto os valores mensais se afastam, em média, da média do histórico (desvio padrão amostral).">
+            <div class="kpi-label">Desvio padrão</div>
+            <div class="kpi-value kpi-value-sm" x-text="fmt(series.kpis.stats.std)"></div>
+            <div class="kpi-hint">Dispersão mensal em torno da média.</div>
+          </div>
+          <div class="kpi-card"
+            title="Erro padrão da média = desvio padrão ÷ raiz do nº de meses. Mede a incerteza da média mensal.">
+            <div class="kpi-label">Erro padrão da média</div>
+            <div class="kpi-value kpi-value-sm" x-text="fmt(series.kpis.stats.sem)"></div>
+            <div class="kpi-hint">Desvio padrão ÷ √n: incerteza da média mensal.</div>
+          </div>
+        </div>
+      </template>
+    </aside>
+
+    <section class="grid-pane">
+      <div x-ref="gridEl" id="ag-grid" class="ag-theme-alpine"></div>
+    </section>
+
+    <div class="modal-backdrop" x-show="dialog" style="display:none" @keydown.escape.window="closeDialog()"
+      @click.self="closeDialog()">
+      <div class="modal">
+        <template x-if="dialog === 'save'">
+          <div>
+            <h2 class="modal-title">Salvar estudo</h2>
+            <p class="modal-text">Dê um nome a este estudo para poder reabri-lo depois. Os valores projetados já estão
+              gravados no banco local.</p>
+            <div class="modal-meta"
+              x-text="currentStudy ? `ID ${currentStudy.short_id} · rodou em ${fmtDateTime(currentStudy.started_at)}` : ''">
+            </div>
+            <input type="text" class="modal-input" maxlength="120" placeholder="Nome do estudo" x-model="saveName"
+              x-ref="saveInput" @keydown.enter="saveStudy()">
+            <div class="modal-error" x-show="saveError" x-text="saveError"></div>
+            <div class="modal-actions">
+              <button class="secondary" type="button" @click="closeDialog()">Agora não</button>
+              <button type="button" @click="saveStudy()" :disabled="saving || !saveName.trim()">Salvar</button>
+            </div>
+          </div>
+        </template>
+        <template x-if="dialog === 'delete'">
+          <div>
+            <h2 class="modal-title">Excluir estudo?</h2>
+            <p class="modal-text"><strong
+                x-text="deleteTarget && (deleteTarget.saved ? deleteTarget.name : 'Estudo sem nome')"></strong></p>
+            <div class="modal-meta"
+              x-text="deleteTarget ? `ID ${deleteTarget.short_id} · rodou em ${fmtDateTime(deleteTarget.started_at)} · ${deleteTarget.n_series} séries` : ''">
+            </div>
+            <p class="modal-text">As projeções, o backtest e as métricas deste estudo serão apagados
+              <strong>definitivamente</strong> do banco local. O arquivo importado não é afetado. Esta ação não pode ser
+              desfeita.</p>
+            <div class="modal-error" x-show="deleteError" x-text="deleteError"></div>
+            <div class="modal-actions">
+              <button class="secondary" type="button" @click="cancelDelete()" :disabled="deleting">Cancelar</button>
+              <button class="danger" type="button" @click="confirmDelete()" :disabled="deleting">Excluir
+                definitivamente</button>
+            </div>
+          </div>
+        </template>
+        <template x-if="dialog === 'open'">
+          <div>
+            <h2 class="modal-title">Abrir estudo</h2>
+            <label class="modal-check">
+              <input type="checkbox" :checked="showUnnamed" @change="toggleShowUnnamed()">
+              Mostrar rodadas sem nome
+              <span class="modal-check-count" x-show="!showUnnamed && unnamedCount()"
+                x-text="`(${unnamedCount()} oculta${unnamedCount() > 1 ? 's' : ''})`"></span>
+            </label>
+            <div class="empty-state" x-show="studiesLoading">Carregando…</div>
+            <div class="empty-state" x-show="!studiesLoading && !visibleStudies().length"
+              x-text="!showUnnamed && unnamedCount() ? 'Nenhum estudo salvo com nome. Marque “Mostrar rodadas sem nome” para ver as demais.' : 'Nenhum estudo concluído ainda. Rode uma projeção primeiro.'">
+            </div>
+            <div class="studies-list" x-show="visibleStudies().length">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Estudo</th>
+                    <th>Arquivo</th>
+                    <th>Rodou em</th>
+                    <th>Horizonte</th>
+                    <th>Séries</th>
+                    <th>Métodos</th>
+                    <th>ID</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="st in visibleStudies()" :key="st.run_id">
+                    <tr @click="openStudy(st.run_id)" :title="'Abrir ' + (st.name || 'estudo sem nome')">
+                      <td :class="{muted: !st.saved}" x-text="st.saved ? st.name : 'Sem nome'"></td>
+                      <td x-text="st.filename"></td>
+                      <td x-text="fmtDateTime(st.started_at)"></td>
+                      <td x-text="st.horizon ? st.horizon + ' meses' : '—'"></td>
+                      <td x-text="st.n_series"></td>
+                      <td :title="st.models.join(', ')" x-text="st.models.length"></td>
+                      <td x-text="st.short_id"></td>
+                      <td><button type="button" class="danger small" @click.stop="askDelete(st)"
+                          title="Excluir este estudo do banco">Excluir</button></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="modal-actions">
+              <button class="secondary" type="button" @click="closeDialog()">Fechar</button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <div class="error-banner" x-show="errorMessage" x-text="errorMessage"></div>
+  </div>
+
+  <script src="vendor/alpine.min.js" defer></script>
+  <script src="app.js"></script>
+</body>
+
+</html>

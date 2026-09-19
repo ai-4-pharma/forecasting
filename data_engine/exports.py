@@ -877,6 +877,101 @@ def export_results(conn, run_id: str, config: ExportConfig) -> ExportArtifact:
     return _csv_artifact(out_df, filename, mapping.delimiter, meta)
 
 
+def _period_labels(dates: list) -> dict:
+    """ds → rótulo de coluna: YYYYMM se todas as datas são dia 1, senão ISO."""
+    monthly = all(d.day == 1 for d in dates)
+    return {d: d.strftime("%Y%m" if monthly else "%Y-%m-%d") for d in dates}
+
+
+def _wide_by_node(
+    frame: pl.DataFrame, meta: pl.DataFrame, dim_names: list[str], value_col: str
+) -> pl.DataFrame:
+    """node_id/measure/ds/valor → dimensões (+ medida) + uma coluna por período."""
+    labels = _period_labels(sorted(frame["ds"].unique().to_list()))
+    piv = (
+        frame.select("node_id", "measure", "ds", value_col)
+        .with_columns(pl.col("ds").replace_strict(labels).alias("_col"))
+        .pivot(
+            on="_col",
+            index=["node_id", "measure"],
+            values=value_col,
+            aggregate_function="first",
+        )
+    )
+    dim_meta = meta.select(["node_id"] + dim_names)
+    ordered = list(labels.values())
+    return (
+        piv.join(dim_meta, on="node_id", how="left")
+        .sort(dim_names + ["measure"], nulls_last=True)
+        .select(dim_names + ["measure"] + ordered)
+    )
+
+
+def export_by_model_xlsx(
+    conn, run_id: str, scenario_id: str = "base"
+) -> ExportArtifact:
+    """XLSX no formato da base de origem: `Historico` + uma aba por modelo.
+
+    Só nós-folha (a granularidade do arquivo de origem). Cada aba tem as
+    colunas de dimensão, a medida (omitida se houver uma só) e uma coluna por
+    período: histórico observado em `Historico`, previsão do modelo nas demais.
+    """
+    study = load_run_study(conn, run_id)
+    mapping = _run_mapping(conn, run_id)
+    dim_names = list(study.dimension_names)
+    rf = ResultFilter(run_id=run_id, node_level="folha", scenario_id=scenario_id)
+    preds = _query_predictions(conn, run_id, rf)
+    if preds.height == 0:
+        raise KeyError(f"Run {run_id} sem previsões de folha para exportar")
+
+    nodes = _query_nodes(conn, run_id)
+    meta = _node_meta(conn, run_id, nodes, study)
+    measures = sorted(preds["measure"].unique().to_list())
+    leaf_ids = preds["node_id"].unique().to_list()
+
+    hist_parts = [_view_history(conn, run_id, leaf_ids, m) for m in measures]
+    hist = pl.concat([h for h in hist_parts if h.height]) if any(
+        h.height for h in hist_parts
+    ) else pl.DataFrame()
+
+    def _finish(df: pl.DataFrame) -> pl.DataFrame:
+        return df if len(measures) > 1 else df.drop("measure")
+
+    wb = openpyxl.Workbook()
+    first_ws = wb.active
+    if first_ws is not None:
+        wb.remove(first_ws)  # type: ignore[arg-type]
+
+    if hist.height:
+        _write_sheet(
+            wb, "Historico", _finish(_wide_by_node(hist, meta, dim_names, "y"))
+        )
+    used = {"Historico"}
+    for alias in sorted(preds["model_alias"].unique().to_list()):
+        sub = preds.filter(pl.col("model_alias") == alias)
+        name = alias[:31]
+        while name in used:
+            name = name[:-1] + "_"
+        used.add(name)
+        _write_sheet(
+            wb, name, _finish(_wide_by_node(sub, meta, dim_names, "yhat"))
+        )
+
+    export_cfg = ExportConfig(
+        format=ExportFormat.XLSX, scenario_id=scenario_id, level="folha"
+    )
+    _write_metadata_sheet(wb, _export_metadata(conn, run_id, export_cfg, study, mapping))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return ExportArtifact(
+        f"forecast_{run_id}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        buf.getvalue(),
+        preds.height,
+        {},
+    )
+
+
 def export_metrics_csv(conn, run_id: str, config: ExportConfig) -> ExportArtifact:
     """CSV separado de métricas por série/medida do recorte (sec 12.2)."""
     study = load_run_study(conn, run_id)

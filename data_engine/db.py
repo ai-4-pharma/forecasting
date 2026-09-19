@@ -123,7 +123,9 @@ SCHEMA_TABLES = {
             status VARCHAR,
             started_at TIMESTAMP,
             ended_at TIMESTAMP,
-            summary_json VARCHAR
+            summary_json VARCHAR,
+            study_name VARCHAR,
+            saved_at TIMESTAMP
         )
     """,
     "run_nodes": """
@@ -264,6 +266,10 @@ def open_database(path: Path) -> duckdb.DuckDBPyConnection:
 def initialize_database(conn) -> None:
     for sql in SCHEMA_TABLES.values():
         conn.execute(sql)
+    # Estudo salvo (nome dado pelo usuário + data/hora do salvamento). Colunas
+    # aditivas: bases criadas antes ganham as colunas sem migração de versão.
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS study_name VARCHAR")
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS saved_at TIMESTAMP")
     row = conn.execute(
         "SELECT value FROM app_meta WHERE key = ?", [SCHEMA_VERSION_KEY]
     ).fetchone()
@@ -432,6 +438,16 @@ def load_dataset(
 
 
 def save_preparation(conn, dataset_id: str, prepared: PreparedDataset) -> str:
+    # preparation_id e um hash do conteudo (B19): reenviar o mesmo arquivo com
+    # a mesma politica gera o mesmo id de proposito, entao um id ja existente
+    # significa "mesmo conteudo ja preparado antes" - reaproveita em vez de
+    # violar a chave primaria (S2.4: descoberto ao reenviar N05A.xlsx 2x).
+    existing = conn.execute(
+        "SELECT 1 FROM preparations WHERE preparation_id = ?",
+        [prepared.preparation_id],
+    ).fetchone()
+    if existing:
+        return prepared.preparation_id
     with _tx(conn):
         conn.execute(
             "INSERT INTO preparations (preparation_id, dataset_id, policy_json,"
@@ -503,68 +519,100 @@ def create_run(
 
 
 def persist_batch(conn, run_id: str, batch_id: str, result: ForecastBatch) -> None:
+    """Grava previsões/CV/scores em lote (`register` + `INSERT ... SELECT`).
+
+    Mesmo padrão de `save_dataset`/`save_preparation`: evita 1 `conn.execute`
+    por linha, que dominava o tempo de persistência em rodadas grandes (S1.3).
+    """
     with _tx(conn):
-        for r in result.predictions.to_dicts():
+        if result.predictions.height:
+            df = result.predictions.with_columns(
+                pl.lit(run_id).alias("run_id")
+            ).select(
+                "run_id",
+                "node_id",
+                "measure",
+                "scenario_id",
+                "ds",
+                pl.col("yhat").cast(pl.Float64),
+                pl.col("lo80").cast(pl.Float64),
+                pl.col("hi80").cast(pl.Float64),
+                "model_alias",
+                "interval_method",
+                "status",
+            )
+            conn.register("_tmp_forecasts", df)
             conn.execute(
-                "INSERT OR REPLACE INTO forecasts (run_id, node_id, measure,"
+                "INSERT OR REPLACE INTO forecasts SELECT run_id, node_id, measure,"
                 " scenario_id, ds, yhat, lo80, hi80, model_alias, interval_method,"
-                " status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    run_id,
-                    r["node_id"],
-                    r["measure"],
-                    r["scenario_id"],
-                    r["ds"],
-                    float(r["yhat"]),
-                    float(r["lo80"]) if r.get("lo80") is not None else None,
-                    float(r["hi80"]) if r.get("hi80") is not None else None,
-                    r["model_alias"],
-                    r["interval_method"],
-                    r["status"],
-                ],
+                " status FROM _tmp_forecasts"
             )
-        for r in result.cv_predictions.to_dicts():
-            conn.execute(
-                "INSERT OR REPLACE INTO cv_results (run_id, node_id, measure,"
-                " model_alias, cutoff, ds, y_actual, yhat, evaluated, failure_reason)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    run_id,
-                    r["node_id"],
-                    r["measure"],
-                    r["model_alias"],
-                    r["cutoff"],
-                    r["ds"],
-                    float(r["y_actual"]) if r.get("y_actual") is not None else None,
-                    float(r["yhat"]) if r.get("yhat") is not None else None,
-                    bool(r.get("evaluated", True)),
-                    r.get("failure_reason"),
-                ],
+            conn.unregister("_tmp_forecasts")
+
+        if result.cv_predictions.height:
+            df = result.cv_predictions.with_columns(
+                pl.lit(run_id).alias("run_id")
+            ).select(
+                "run_id",
+                "node_id",
+                "measure",
+                "model_alias",
+                "cutoff",
+                "ds",
+                pl.col("y_actual").cast(pl.Float64),
+                pl.col("yhat").cast(pl.Float64),
+                pl.col("evaluated").fill_null(True).cast(pl.Boolean),
+                pl.col("failure_reason").fill_null(""),
             )
-        for r in result.scores.to_dicts():
+            conn.register("_tmp_cv_results", df)
             conn.execute(
-                "INSERT OR REPLACE INTO model_scores (run_id, node_id, measure,"
+                "INSERT OR REPLACE INTO cv_results SELECT run_id, node_id, measure,"
+                " model_alias, cutoff, ds, y_actual, yhat, evaluated, failure_reason"
+                " FROM _tmp_cv_results"
+            )
+            conn.unregister("_tmp_cv_results")
+
+        if result.scores.height:
+            has_selection_cols = "selected" in result.scores.columns
+            df = result.scores.with_columns(
+                pl.lit(run_id).alias("run_id"),
+                (
+                    pl.col("selected").fill_null(False).cast(pl.Boolean)
+                    if has_selection_cols
+                    else pl.col("eligible").fill_null(False).cast(pl.Boolean)
+                ).alias("selected"),
+                (
+                    pl.col("selection_reason").fill_null("usuario")
+                    if has_selection_cols
+                    else pl.lit("usuario")
+                ).alias("selection_reason"),
+                pl.lit(False).alias("fallback_used"),
+                pl.lit("{}").alias("params_json"),
+            ).select(
+                "run_id",
+                "node_id",
+                "measure",
+                "model_alias",
+                pl.col("mae").cast(pl.Float64),
+                pl.col("rmse").cast(pl.Float64),
+                pl.col("wape").cast(pl.Float64),
+                pl.col("bias").cast(pl.Float64),
+                pl.col("n_eval").fill_null(0).cast(pl.Int64),
+                pl.col("n_folds").fill_null(0).cast(pl.Int64),
+                pl.col("eligible").fill_null(False).cast(pl.Boolean),
+                "selected",
+                "selection_reason",
+                "fallback_used",
+                "params_json",
+            )
+            conn.register("_tmp_model_scores", df)
+            conn.execute(
+                "INSERT OR REPLACE INTO model_scores SELECT run_id, node_id, measure,"
                 " model_alias, mae, rmse, wape, bias, n_eval, n_folds, eligible,"
-                " selected, selection_reason, fallback_used, params_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    run_id,
-                    r["node_id"],
-                    r["measure"],
-                    r["model_alias"],
-                    float(r["mae"]) if r.get("mae") is not None else None,
-                    float(r["rmse"]) if r.get("rmse") is not None else None,
-                    float(r["wape"]) if r.get("wape") is not None else None,
-                    float(r["bias"]) if r.get("bias") is not None else None,
-                    int(r.get("n_eval", 0)),
-                    int(r.get("n_folds", 0)),
-                    bool(r.get("eligible", True)),
-                    bool(r.get("eligible", False)),
-                    "usuario",
-                    False,
-                    "{}",
-                ],
+                " selected, selection_reason, fallback_used, params_json"
+                " FROM _tmp_model_scores"
             )
+            conn.unregister("_tmp_model_scores")
 
 
 def persist_nodes(conn, run_id: str, nodes: pl.DataFrame) -> None:
@@ -572,23 +620,27 @@ def persist_nodes(conn, run_id: str, nodes: pl.DataFrame) -> None:
 
     `coverage_json` guarda as entidades-folha sob cada nó; `level` usa o nome
     do nível (`folha` ou `level_name`). Escrita idempotente por (run, node).
+    Mesmo padrão `register` + `INSERT ... SELECT` de `persist_batch` (S1.3).
     """
+    if not nodes.height:
+        return
     with _tx(conn):
-        for r in nodes.to_dicts():
-            conn.execute(
-                "INSERT OR REPLACE INTO run_nodes (run_id, node_id, level,"
-                " parent_node_id, entity_id, dimensions_json, coverage_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [
-                    run_id,
-                    r["node_id"],
-                    r.get("level", "folha"),
-                    r.get("parent_node_id"),
-                    r.get("entity_id"),
-                    r.get("dimensions_json", "{}"),
-                    r.get("coverage_json", "{}"),
-                ],
-            )
+        df = nodes.with_columns(pl.lit(run_id).alias("run_id")).select(
+            "run_id",
+            "node_id",
+            pl.col("level").fill_null("folha"),
+            "parent_node_id",
+            "entity_id",
+            pl.col("dimensions_json").fill_null("{}"),
+            pl.col("coverage_json").fill_null("{}"),
+        )
+        conn.register("_tmp_run_nodes", df)
+        conn.execute(
+            "INSERT OR REPLACE INTO run_nodes SELECT run_id, node_id, level,"
+            " parent_node_id, entity_id, dimensions_json, coverage_json"
+            " FROM _tmp_run_nodes"
+        )
+        conn.unregister("_tmp_run_nodes")
 
 
 def finish_run(conn, summary: RunSummary) -> None:

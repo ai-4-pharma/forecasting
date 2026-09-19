@@ -31,7 +31,10 @@ from .hierarchy import (
     reconcile_bottom_up,
 )
 from .cv import build_cv_windows, evaluate_candidates
-from .final import _forecast_with_fallback  # noqa: F401  (compat/uso em testes)
+from .final import (  # noqa: F401  (compat/uso em testes)
+    _forecast_with_fallback,
+    forecast_final_panel,
+)
 from .scenarios import generate_scenario_predictions
 
 
@@ -134,7 +137,17 @@ def _progress_message(
 
 
 def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
-    """Fluxo de eventos em lotes: profile -> cv -> forecast -> scenario -> reconcile."""
+    """Fluxo de eventos em lotes: profile -> cv -> forecast -> scenario -> reconcile.
+
+    Persistência parcial (S1.4): os eventos `CV` (um por lote de `evaluate_candidates`)
+    e `FORECAST` emitidos por `forecast_final_panel` (um por alias vetorizado) trazem
+    `payload["partial_batch"]` — um `ForecastBatch` só com as linhas novas daquele
+    passo. O consumidor deve chamar `persist_batch(conn, run_id, batch_id, ev.payload
+    ["partial_batch"])` a cada evento que tiver essa chave, para tornar o progresso
+    visível antes do fim da rodada. O evento `COMPLETED` continua trazendo o batch
+    consolidado em `payload["batch"]`; persistir os dois é seguro e idempotente
+    (`INSERT OR REPLACE` por chave primária em `persist_batch`), sem duplicar linhas.
+    """
     config = inputs.config
     study = inputs.study
     prepared = inputs.prepared
@@ -270,12 +283,20 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             ml_cv_preds=ml_cv_preds or None,
         )
         batch_out.append(fb)
+        partial_batch = ForecastBatch(
+            pl.DataFrame(_empty_pred()).clear(),
+            fb.cv_predictions,
+            fb.scores,
+            fb.selection,
+            fb.issues,
+        )
         yield RunEvent(
             RunStage.CV,
             min(i + config.batch_size, total),
             total,
             f"Folds avaliados para lote {i // config.batch_size + 1}.",
             batch_id=f"cv-{i // config.batch_size}",
+            payload={"partial_batch": partial_batch},
         )
 
     # previsões finais: TODOS os modelos escolhidos pelo usuário por série
@@ -296,6 +317,56 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
         else None
     )
 
+    # previsão final vetorizada: 1 StatsForecast por alias sobre o painel
+    # inteiro (S1.1). Cobre todos os aliases estatísticos simples; o loop por
+    # série abaixo trata só o que sobrar (AutoARIMA_X/LightGBM/XGBoost/
+    # ZeroBaseline e séries em que o painel falhou).
+    effective_aliases: dict[str, list[str]] = {
+        sid: (aliases_by_node.get(sid) or ["Naive"]) for sid in all_series
+    }
+    panel_preds, panel_covered = forecast_final_panel(
+        working,
+        effective_aliases,
+        config.horizon_periods,
+        study.model_frequency,
+        config,
+    )
+    preds.extend(panel_preds)
+
+    covered_by_alias: dict[str, set[str]] = {}
+    panel_success_count: dict[str, int] = {}
+    for uid, alias in panel_covered:
+        covered_by_alias.setdefault(alias, set()).add(uid)
+        panel_success_count[uid] = panel_success_count.get(uid, 0) + 1
+
+    preds_by_alias: dict[str, list[dict]] = {}
+    for r in panel_preds:
+        preds_by_alias.setdefault(r["model_alias"], []).append(r)
+    empty_cv_zero = pl.DataFrame(_empty_cv()).clear()
+    empty_scores_zero = pl.DataFrame(_empty_scores()).clear()
+    empty_sel_zero = pl.DataFrame(_empty_select()).clear()
+
+    panel_aliases = sorted(covered_by_alias)
+    for a_idx, alias in enumerate(panel_aliases, start=1):
+        n_series_alias = len(covered_by_alias[alias])
+        partial_batch = ForecastBatch(
+            pl.DataFrame(preds_by_alias.get(alias, [])),
+            empty_cv_zero,
+            empty_scores_zero,
+            empty_sel_zero,
+            [],
+        )
+        yield RunEvent(
+            RunStage.FORECAST,
+            n_series_alias,
+            total,
+            f"{alias} ({a_idx}/{len(panel_aliases)}) — {n_series_alias} séries.",
+            payload={"partial_batch": partial_batch},
+        )
+        if _cancel_requested(inputs.should_cancel):
+            yield _cancelled_event(batch_out, preds, n_failed, total, nodes=nodes_frame)
+            return
+
     # preds/n_failed, inicializados antes do loop de CV para o cancelamento
     # parcial reutilizá-los; aqui não são redefinidos (sec 8.2).
     started_at = time.perf_counter()
@@ -305,10 +376,12 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
             return
         series = working.filter(pl.col("series_id") == series_id).sort("ds")
         measure = series["measure"].first()
-        requested = aliases_by_node.get(series_id) or ["Naive"]
-        series_rows = 0
+        requested = effective_aliases[series_id]
+        remaining = [a for a in requested if (series_id, a) not in panel_covered]
+        series_rows = panel_success_count.get(series_id, 0)
         series_failed: list[str] = []
-        for m_idx, alias in enumerate(requested, start=1):
+        n_done_before = len(requested) - len(remaining)
+        for r_idx, alias in enumerate(remaining, start=1):
             rows, status = _pkg_attr("forecast_final")(
                 series,
                 alias,
@@ -351,7 +424,7 @@ def run_forecast(inputs: RunInputs) -> Iterator[RunEvent]:
                     total,
                     measure,
                     alias,
-                    m_idx,
+                    n_done_before + r_idx,
                     len(requested),
                     started_at,
                     ok=bool(rows and status == "ok"),

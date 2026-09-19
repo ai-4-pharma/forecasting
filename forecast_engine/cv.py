@@ -16,6 +16,7 @@ from contracts import (
     ValidationIssue,
     MIN_CV_FIRST_TRAIN,
     MIN_INTERMITTENT_POSITIVES,
+    CORE_ALIASES,
 )
 
 from .dates import (
@@ -147,6 +148,7 @@ def evaluate_candidates(
     # Pass 1: elegibilidade por série (mesma regra de antes, sem fits).
     eligible_by_series: dict = {}
     short_series: set = set()
+    intermittent_profile: dict = {}
     for (series_id, measure), series in series_by.items():
         n = series.height
         if n < 4:
@@ -156,6 +158,12 @@ def evaluate_candidates(
         positives = (yvals > 0).sum()
         all_zero = bool((yvals == 0).all())
         has_negatives = bool((yvals < 0).any())
+        # perfil rápido (S1.7): série intermitente quando >= 60% de zeros e sem
+        # negativos; usado só para desempatar o ranking automático, nunca para
+        # decidir elegibilidade (regra já existente acima).
+        intermittent_profile[(series_id, measure)] = (
+            not all_zero and not has_negatives and (n - positives) / n >= 0.6
+        )
         eligible_aliases: list[str] = []
         for c in candidates:
             if c.need_ml:
@@ -254,6 +262,15 @@ def evaluate_candidates(
             }
         )
 
+    # Ranking automático (S1.7): sem seleção manual do usuário (laboratório),
+    # o motor elege 1 baseline por (node, measure) entre CORE_ALIASES por WAPE
+    # de 1 fold; desempate por MAE, depois pelo rank do ModelSpec. Perfil
+    # intermitente (>=60% zeros) prioriza CrostonSBA/TSB no desempate.
+    rank_by_alias = {c.alias: c.rank for c in candidates}
+    user_selected_aliases = bool(
+        getattr(config, "candidate_aliases", None) if config is not None else None
+    )
+
     # Pass 3: monta scores por série (ML pré-computado + painel + X/Zero locais).
     for (series_id, measure), series in series_by.items():
         node_id = series_id
@@ -333,8 +350,63 @@ def evaluate_candidates(
                 "n_folds": n_windows,
                 "eligible": True,
             }
+        # Ranking automático (S1.7): 1 baseline por (node, measure) entre
+        # CORE_ALIASES por WAPE de 1 fold; nada disso altera `eligible_aliases`
+        # nem a `selection` que o runner usa para decidir o que reajustar —
+        # o motor continua rodando/mostrando todos os modelos elegíveis.
+        winner_alias: str | None = None
+        winner_reason = "auto_wape_1fold"
+        rank_order: list[str] = []
+        if not user_selected_aliases:
+            if eligible_aliases == ["ZeroBaseline"]:
+                if scores_raw.get("ZeroBaseline") is not None:
+                    winner_alias = "ZeroBaseline"
+                    winner_reason = "perfil_zero_total"
+                    rank_order = ["ZeroBaseline"]
+            else:
+                is_intermittent = intermittent_profile.get((series_id, measure), False)
+
+                def _rank_key(alias: str, _is_intermittent=is_intermittent):
+                    s = scores_raw.get(alias)
+                    wape_v = (
+                        s["wape"] if s and s.get("wape") is not None else float("inf")
+                    )
+                    mae_v = s["mae"] if s and s.get("mae") is not None else float("inf")
+                    priority = (
+                        0
+                        if (_is_intermittent and alias in ("CrostonSBA", "TSB"))
+                        else 1
+                    )
+                    return (wape_v, priority, mae_v, rank_by_alias.get(alias, 100))
+
+                core_candidates = [
+                    a for a in CORE_ALIASES if scores_raw.get(a) is not None
+                ]
+                if core_candidates:
+                    rank_order = sorted(core_candidates, key=_rank_key)
+                    winner_alias = rank_order[0]
+                    winner_reason = (
+                        "perfil_intermitente"
+                        if (is_intermittent and winner_alias in ("CrostonSBA", "TSB"))
+                        else "auto_wape_1fold"
+                    )
+
+        alt_rank = {alias: k for k, alias in enumerate(rank_order[1:], start=1)}
         for alias in scores_raw:
             s = scores_raw[alias]
+            is_winner = alias == winner_alias
+            if user_selected_aliases:
+                selected = bool(s)
+                reason = "usuario"
+            elif is_winner:
+                selected = True
+                reason = winner_reason
+            elif alias in alt_rank:
+                selected = False
+                reason = f"alternativa_rank_{alt_rank[alias]}"
+            else:
+                selected = False
+                reason = "nao_avaliado_no_core" if bool(s) else "usuario"
             score_rows.append(
                 {
                     "node_id": node_id,
@@ -348,6 +420,8 @@ def evaluate_candidates(
                     "n_folds": s["n_folds"] if s else 0,
                     "eligible": bool(s) if s is not None else False,
                     "failure_reason": "" if s else "no_evaluable_folds",
+                    "selected": selected,
+                    "selection_reason": reason,
                 }
             )
         for alias in eligible_aliases:
@@ -551,16 +625,24 @@ def _run_folds_panel(
     if mdl is None:
         return eval_rows
     freq_str = _freq_str(freq)
+
+    # Particiona o painel do escopo UMA vez (em vez de 2 filters/série/fold):
+    # cada (node_id, measure) vira uma fatia pequena reaproveitada em todos
+    # os folds.
+    node_ids = list({sid for sid, _ in scope})
+    restricted = prepared.filter(pl.col("series_id").is_in(node_ids))
+    parts = restricted.partition_by(["series_id", "measure"], as_dict=True)
+
     for w in windows:
         h = len(w.eval_dates)
         trains = []
         tests: dict = {}
-        for node_id, measure in scope:
-            tr = prepared.filter(
-                pl.col("series_id") == node_id,
-                pl.col("measure") == measure,
-                pl.col("ds") <= w.cutoff,
-            ).sort("ds")
+        uid_to_key: dict[str, tuple] = {}
+        for key in scope:
+            sub = parts.get(key)
+            if sub is None:
+                continue
+            tr = sub.filter(pl.col("ds") <= w.cutoff).sort("ds")
             if tr.height < 4:
                 continue
             trains.append(
@@ -568,12 +650,9 @@ def _run_folds_panel(
                     pl.col("series_id").alias("unique_id"), pl.col("ds"), pl.col("y")
                 )
             )
-            te = prepared.filter(
-                pl.col("series_id") == node_id,
-                pl.col("measure") == measure,
-                pl.col("ds") > w.cutoff,
-            ).sort("ds")
-            tests[(node_id, measure)] = {r["ds"]: r["y"] for r in te.to_dicts()}
+            uid_to_key[key[0]] = key
+            te = sub.filter(pl.col("ds") > w.cutoff).sort("ds")
+            tests[key] = dict(zip(te["ds"].to_list(), te["y"].to_list()))
         if not trains:
             continue
         panel = pl.concat(trains).sort(["unique_id", "ds"])
@@ -598,7 +677,7 @@ def _run_folds_panel(
             except Exception:  # noqa: BLE001
                 pass
             # recupera (node_id, measure) — series_id já é único por medida
-            match = next((k for k in tests if k[0] == uid), None)
+            match = uid_to_key.get(uid)
             if match is None:
                 continue
             node_id, measure = match

@@ -22,7 +22,7 @@ if not exist ".venv" (
 )
 
 echo.
-echo Instalando dependencias...
+echo Instalando dependencias do nucleo (requirements.txt)...
 call ".venv\Scripts\activate.bat"
 python -m pip install --upgrade pip
 pip install -r requirements.txt
@@ -34,8 +34,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo Verificando os pacotes...
-python -c "import polars, streamlit, statsforecast, duckdb, openpyxl, plotly, mlforecast, lightgbm, xgboost; print('pacotes ok')"
+echo Verificando os pacotes do nucleo...
+python -c "import polars, streamlit, statsforecast, duckdb, openpyxl, plotly; print('pacotes ok')"
 if errorlevel 1 (
     echo.
     echo AVISO: algum pacote nao foi importado corretamente.
@@ -46,5 +46,8 @@ echo.
 echo ============================================
 echo  Instalacao concluida com sucesso!
 echo  Use "iniciar.bat" para abrir o Forecast Community.
+echo.
+echo  Aprendizado global (LightGBM/XGBoost) e OPCIONAL. Para habilitar,
+echo  rode depois:  .venv\Scripts\pip.exe install -r requirements-ml.txt
 echo ============================================
 pause

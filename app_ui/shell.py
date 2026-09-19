@@ -23,8 +23,6 @@ if not _logger.handlers:
     _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     _logger.addHandler(_handler)
 
-import re
-
 import data_engine
 import forecast_engine
 
@@ -217,39 +215,6 @@ def _db() -> object:
     return st.session_state.conn
 
 
-def _parse_period_col(col_name: str) -> str | None:
-    """Tenta converter o nome da coluna num período ISO YYYY-MM-01 (data completa,
-    exigida por `date.fromisoformat` em `data_engine.normalize_file`).
-    Aceita: YYYYMM, YYYY-MM, YYYY/MM, YYYY-Qn, YYYY, datetime serializado
-    (ex.: "2016-06-01 00:00:00"), número serial (ex.: "201606.0") e MM/YYYY.
-    Retorna None se não reconhecer.
-    """
-    c = str(col_name).strip()
-    # datetime já em formato ISO (ex.: openpyxl convertendo cabeçalho para texto)
-    m = re.match(r"^(\d{4})-(\d{2})-\d{2}([ T].*)?$", c)
-    if m:
-        y, mth = int(m.group(1)), int(m.group(2))
-        if 1 <= mth <= 12:
-            return f"{y:04d}-{mth:02d}-01"
-    m = re.match(r"^(\d{4})(\d{2})(\.0)?$", c)
-    if m:
-        y, mth = int(m.group(1)), int(m.group(2))
-        if 1 <= mth <= 12:
-            return f"{y:04d}-{mth:02d}-01"
-    m = re.match(r"^(\d{4})[-/](\d{2})$", c)
-    if m:
-        y, mth = int(m.group(1)), int(m.group(2))
-        if 1 <= mth <= 12:
-            return f"{y:04d}-{mth:02d}-01"
-    m = re.match(r"^(\d{2})/(\d{4})$", c)
-    if m:
-        mth, y = int(m.group(1)), int(m.group(2))
-        if 1 <= mth <= 12:
-            return f"{y:04d}-{mth:02d}-01"
-    m = re.match(r"^(\d{4})-Q([1-4])$", c, re.IGNORECASE)
-    if m:
-        qstart = {1: "01", 2: "04", 3: "07", 4: "10"}
-        return f"{m.group(1)}-{qstart[int(m.group(2))]}-01"
-    if re.match(r"^\d{4}$", c):
-        return f"{c}-01-01"
-    return None
+# _parse_period_col vive em data_engine.dates (S2.2); reexportado aqui para não
+# quebrar `app_ui.mapping` e demais importadores existentes.
+from data_engine.dates import _parse_period_col  # noqa: E402,F401

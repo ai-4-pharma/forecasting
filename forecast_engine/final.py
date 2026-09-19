@@ -13,6 +13,7 @@ from contracts import (
     RegressorSpec,
     IntervalMethod,
     INT_MIN_HISTORY_REGULAR,
+    PredictionStatus,
 )
 
 from .dates import (
@@ -22,7 +23,7 @@ from .dates import (
     _gen_future_dates,
 )
 from .metrics import _apply_floor
-from .models import _extract_yhat
+from .models import _build_sf_model, _extract_yhat, _sf_n_jobs
 from .regressors import _forecast_regressor_final
 from .ml import ml_final
 from ._quiet import quiet_native
@@ -196,6 +197,135 @@ def forecast_final(
             }
         )
     return rows, "ok"
+
+
+def forecast_final_panel(
+    working: pl.DataFrame,
+    aliases_by_node: dict[str, list[str]],
+    horizon: int,
+    freq: SourceFrequency,
+    config: ForecastConfig,
+) -> tuple[list[dict], set[tuple[str, str]]]:
+    """Previsão final vetorizada: 1 `StatsForecast` por alias sobre o painel inteiro.
+
+    Cobre os aliases da fábrica única (`_build_sf_model`); `AutoARIMA_X`,
+    `LightGBM`, `XGBoost` e `ZeroBaseline` não têm fábrica ali e ficam de fora
+    (o chamador continua tratando-os por série). Devolve as linhas no formato
+    de `preds` do runner e o conjunto `(node_id, alias)` cobertos com sucesso —
+    o que não aparece em `covered` cai de volta ao loop por série (painel
+    falhou ou o alias não é vetorizável).
+    """
+    from statsforecast import StatsForecast
+    from statsforecast.models import Naive
+
+    preds: list[dict] = []
+    covered: set[tuple[str, str]] = set()
+
+    wanted: dict[str, list[str]] = {}
+    for node_id, aliases in aliases_by_node.items():
+        for alias in aliases:
+            wanted.setdefault(alias, []).append(node_id)
+
+    if not wanted:
+        return preds, covered
+
+    freq_str = _freq_str(freq)
+    season_len = _effective_season_length(config, freq)
+    meta = working.group_by("series_id").agg(
+        pl.col("entity_id").first(),
+        pl.col("measure").first(),
+        pl.len().alias("n_history"),
+    )
+    meta_map = {
+        r["series_id"]: (r["entity_id"], r["measure"], r["n_history"])
+        for r in meta.to_dicts()
+    }
+
+    for alias, node_ids in wanted.items():
+        mdl = _build_sf_model(alias, season_len)
+        if mdl is None:
+            continue
+        panel = (
+            working.filter(pl.col("series_id").is_in(node_ids))
+            .select(pl.col("series_id").alias("unique_id"), "ds", "y")
+            .sort(["unique_id", "ds"])
+        )
+        if panel.is_empty():
+            continue
+        try:
+            with quiet_native():
+                sf = StatsForecast(
+                    models=[mdl],
+                    freq=freq_str,
+                    n_jobs=_sf_n_jobs(config),
+                    fallback_model=Naive(),
+                )
+                fc = sf.forecast(df=panel, h=horizon, level=[80])
+        except Exception:  # noqa: BLE001
+            continue  # painel falhou por completo: o chamador cai no loop por série
+
+        fc_by_series: dict[str, list[dict]] = {}
+        for row in fc.to_dicts():
+            fc_by_series.setdefault(str(row["unique_id"]), []).append(row)
+
+        for uid, rows in fc_by_series.items():
+            entity_id, measure, n_history = meta_map.get(uid, (None, None, 0))
+            conformal_ok = n_history >= 2 * horizon + INT_MIN_HISTORY_REGULAR
+            out_rows = []
+            for row in sorted(rows, key=lambda r: r["ds"]):
+                yhat = float(row.get(alias, _extract_yhat(row, alias)))
+                lo80 = row.get(f"{alias}-lo-80")
+                hi80 = row.get(f"{alias}-hi-80")
+                if lo80 is None:
+                    lo80 = row.get("lo-80")
+                if hi80 is None:
+                    hi80 = row.get("hi-80")
+                if not conformal_ok:
+                    lo80, hi80 = None, None
+                if yhat != yhat:  # NaN
+                    continue
+                if yhat < 0:
+                    yhat = 0.0
+                lo80 = _apply_floor(float(lo80)) if lo80 is not None else None
+                hi80 = _apply_floor(float(hi80)) if hi80 is not None else None
+                if lo80 is not None and hi80 is not None and lo80 > hi80:
+                    lo80, hi80 = None, None
+                im = (
+                    IntervalMethod.NATIVE.value
+                    if lo80 is not None
+                    else (
+                        IntervalMethod.UNAVAILABLE_INSUFFICIENT_HISTORY.value
+                        if not conformal_ok
+                        else IntervalMethod.NULL.value
+                    )
+                )
+                ds = row["ds"]
+                if hasattr(ds, "date"):
+                    ds = ds.date()
+                elif isinstance(ds, str):
+                    from datetime import date as _date
+
+                    ds = _date.fromisoformat(ds[:10])
+                out_rows.append(
+                    {
+                        "node_id": uid,
+                        "entity_id": entity_id,
+                        "level": "folha",
+                        "measure": measure,
+                        "scenario_id": "base",
+                        "ds": ds,
+                        "yhat": float(yhat),
+                        "lo80": lo80,
+                        "hi80": hi80,
+                        "model_alias": alias,
+                        "interval_method": im,
+                        "status": PredictionStatus.OK.value,
+                    }
+                )
+            if out_rows:
+                preds.extend(out_rows)
+                covered.add((uid, alias))
+    return preds, covered
 
 
 def forecast_candidate(

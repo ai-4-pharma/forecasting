@@ -1,7 +1,8 @@
-# Forecast Community - dependencias (arquivo unico)
+# Forecast Community - dependencias do nucleo (S1.6)
 # Versoes testadas em 17/09/2026, Python 3.13.1 (Windows, CPython).
-# Este arquivo instala tudo o que a aplicacao precisa, incluindo os metodos
-# globais (LightGBM/XGBoost) usados pelo checkbox "Habilitar aprendizado global".
+# ML (LightGBM/XGBoost/MLForecast) e OPCIONAL: ver requirements-ml.txt.
+# Instale so este arquivo para rodar a tela unica (api/) e o motor
+# estatistico (Naive/SeasonalNaive/AutoETS/AutoTheta/CrostonSBA/TSB/...).
 
 # --- Nucleo ---------------------------------------------------------------
 polars==1.44.2
@@ -12,19 +13,17 @@ numpy==2.4.1
 openpyxl==3.1.5
 plotly==5.24.1
 
+# --- API (tela unica, S2) --------------------------------------------------
+# Fixado >= (nao ==) porque o streamlit 1.63 exige starlette>=0.46, que por sua
+# vez exige fastapi/uvicorn/python-multipart mais recentes que os testados
+# isoladamente; ver pip check apos instalar.
+fastapi>=0.118
+uvicorn[standard]>=0.34
+python-multipart>=0.0.20
+
 # --- Interoperabilidade (exigidas por streamlit / polars.to_pandas) -------
 pandas==2.3.3
 pyarrow==19.0.1
 
-# --- Aprendizado global (MLForecast + LightGBM + XGBoost) -----------------
-mlforecast==1.1.0
-lightgbm==4.7.0
-xgboost==2.1.4
-
 # Dependencias transitivas relevantes (instaladas automaticamente, sem pin
-# proprio): utilsforecast e scipy (via statsforecast), scikit-learn e optuna
-# (via mlforecast), altair (via streamlit).
-#
-# Opcional de desempenho: `numba` acelera os loops do utilsforecast usados no
-# caminho ML. Sem ele o pacote avisa que "algumas operacoes podem ficar lentas",
-# mas a aplicacao funciona -- por isso nao e obrigatorio aqui.
+# proprio): utilsforecast e scipy (via statsforecast), altair (via streamlit).

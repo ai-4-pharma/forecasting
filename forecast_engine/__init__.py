@@ -92,6 +92,7 @@ from .cv import (
 
 from .final import (
     forecast_final,
+    forecast_final_panel,
     forecast_candidate,
     _forecast_with_fallback,
 )

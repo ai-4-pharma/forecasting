@@ -10,6 +10,7 @@ from .dates import (
     _period_labels,
     _period_label,
     _parse_period,
+    _parse_period_col,
     parse_date_main,
     build_time_grid,
 )
@@ -24,6 +25,7 @@ from .ingest import (
     _sniff_encoding,
     _suggest_parse_date,
     suggest_time_settings,
+    autodetect_mapping,
     inspect_file,
     _inspect_csv,
     _inspect_xlsx
@@ -42,6 +44,13 @@ from .profile import (
     profile_data,
     prepare_data,
     _winsorize
+)
+
+from .studies import (
+    list_studies,
+    get_study,
+    save_study_name,
+    delete_study,
 )
 
 from .db import (
@@ -83,6 +92,12 @@ from .results import (
     _last_historical_position,
     _mat_view_derived,
     _mat_view_direct,
+    _leaf_dim_frame,
+    build_run_tree,
+    _cv_selected_errors,
+    series_view,
+    series_by_model,
+    exceptions_ranking,
     query_results
 )
 
@@ -110,6 +125,7 @@ from .exports import (
     _write_metadata_sheet,
     _build_xlsx,
     export_results,
+    export_by_model_xlsx,
     export_metrics_csv,
     export_quality_csv
 )

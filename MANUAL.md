@@ -1,6 +1,11 @@
 # MANUAL DE USO — Forecast Community
 
-> Guia completo para o usuário. Versão correspondente ao estado do projeto em 16/09/2026.
+> Guia completo para o usuário. Versão correspondente ao estado do projeto em 18/09/2026.
+>
+> **Dois modos de uso:** a **tela única** (`python -m api`, caminho principal — ver
+> [seção 3.1](#31-tela-única-uso-rápido)) e o **Laboratório** (Streamlit, wizard de 5
+> etapas — seções 4 a 12). Os conceitos de métodos, validação, cenários, hierarquia e
+> MAT valem para os dois; onde algo é exclusivo de um modo, o texto avisa.
 
 ---
 
@@ -9,7 +14,8 @@
 1. [O que é o Forecast Community](#1-o-que-é-o-forecast-community)
 2. [Instalação](#2-instalação)
 3. [Iniciando a aplicação](#3-iniciando-a-aplicação)
-4. [Jornada passo a passo](#4-jornada-passo-a-passo)
+   - [3.1 Tela única (uso rápido)](#31-tela-única-uso-rápido)
+4. [Jornada passo a passo (Laboratório)](#4-jornada-passo-a-passo)
    - [Etapa 1 — Arquivo](#etapa-1--arquivo)
    - [Etapa 2 — Mapeamento](#etapa-2--mapeamento)
    - [Etapa 3 — Qualidade](#etapa-3--qualidade)
@@ -81,14 +87,18 @@ python -m venv .venv
 # Linux/macOS:
 source .venv/bin/activate
 
-# 4. Instale as dependências (arquivo único: núcleo + ML)
+# 4. Instale as dependências do núcleo (motor estatístico, tela única e Laboratório)
 pip install -r requirements.txt
+
+# 5. (opcional) Aprendizado global: LightGBM / XGBoost via MLForecast
+pip install -r requirements-ml.txt
 ```
 
-O `requirements.txt` é único e já inclui **MLForecast, LightGBM e XGBoost** — os
-modelos globais da Etapa 4 ficam disponíveis sem nenhum passo extra. Quem quiser uma
-instalação mínima pode remover o bloco "Aprendizado global" do arquivo: o restante da
-aplicação continua funcionando.
+O `requirements.txt` traz o núcleo, inclusive o servidor da tela única (`fastapi`,
+`uvicorn`, `python-multipart`). O **aprendizado global é opcional** e fica em
+`requirements-ml.txt`: sem ele, `LightGBM` e `XGBoost` simplesmente não aparecem como
+métodos e o resto do produto funciona igual. No Windows, `instalar.bat` instala só o
+núcleo e imprime o comando do complemento ML.
 
 ### Instalar dependências de desenvolvimento
 
@@ -108,13 +118,134 @@ python -c "import streamlit, polars, statsforecast, duckdb; print('OK')"
 
 ## 3. Iniciando a aplicação
 
+**Tela única (caminho principal):**
+
+```bash
+python -m api
+```
+
+Abre o navegador em `http://127.0.0.1:8765`.
+
+**Laboratório (Streamlit — wizard de 5 etapas):**
+
 ```bash
 python -m streamlit run app.py
 ```
 
-A aplicação abre automaticamente no navegador em `http://localhost:8501`.
+Abre em `http://localhost:8501`. No Windows, o `iniciar.bat` abre **este** modo (o
+Laboratório), não a tela única.
+
+> **Não rode os dois ao mesmo tempo:** ambos usam o mesmo banco DuckDB
+> (`.local/forecast.duckdb`), que aceita um único escritor. Após alterar código Python,
+> reinicie o servidor; mudanças em `web/` só precisam de reload do navegador.
 
 > **Nota:** ao abrir pela primeira vez, a pasta `.local/` é criada automaticamente com o banco DuckDB. Essa pasta contém seus dados de trabalho e **nunca deve ser versionada**.
+
+### 3.1 Tela única (uso rápido)
+
+**Em 3 passos:**
+
+1. **Abrir arquivo** — `.xlsx` ou `.csv` no formato largo: colunas de texto viram
+   dimensões (na ordem do arquivo) e colunas com cabeçalho de período (`YYYYMM`,
+   `YYYY-MM`…) viram o histórico. São necessários pelo menos 12 períodos e 1 dimensão. A
+   medida é `unidades` e a frequência é inferida dos períodos. Ao terminar, o topo mostra
+   o nome do arquivo e um resumo de qualidade (zeros e lacunas por série).
+2. **Gerar** — o **Horizonte** (padrão 12) e o painel **Métodos** ficam antes do botão.
+   - *Sem marcar nada:* o sistema recomenda o melhor método **por item** (menor WAPE em 1
+     fold de validação) e guarda o motivo da escolha.
+   - *Marcando métodos (máximo 5):* a rodada executa exatamente esses. O painel separa
+     **Núcleo** e **Avançado**; um ⏱ avisa que o método é lento em bases grandes
+     (`AutoARIMA`, `AutoTBATS`, `LightGBM`, `XGBoost`). `LightGBM`/`XGBoost` só aparecem se
+     o complemento ML estiver instalado. `AutoARIMA_X` não é oferecido aqui (não há tela de regressoras).
+   - Durante a rodada aparece um painel de progresso com as últimas mensagens e a barra
+     (`concluído/total`). Os tempos dependem da base e dos métodos: métodos caros somam
+     tempo e, em 500+ séries, podem levar vários minutos.
+3. **Explorar e exportar** — veja abaixo.
+
+**Áreas da tela**
+
+| Área | O que faz |
+|------|-----------|
+| Topo | Logo à esquerda, título **Análise de Projeção** centralizado e, à direita, botão de tema (☀ Claro / 🌙 Escuro) e chip de status |
+| Barra lateral (parte de cima) | **Novo estudo**, **Abrir estudo**, cartão do estudo atual (nome, ID e data/hora), **Abrir arquivo**, **Horizonte**, **Métodos** (a lista abre flutuando à direita da barra, sobre o gráfico; ao passar o mouse nos métodos com ⏱ aparece um aviso flutuante), **Gerar** e **Exportar Excel** |
+| Barra lateral (parte de baixo, "Filtros") | Busca e seletor hierárquico em cascata (um seletor por dimensão). Marque **mais de um valor** em qualquer nível: o nível seguinte mostra a união dos filhos. Chips permitem remover itens |
+| Centro | Gráfico com 3 abas (abaixo) |
+| Direita | Cards do item ativo, cada um com uma explicação curta embaixo (veja a tabela a seguir) |
+| Baixo | Grid com os valores projetados do horizonte |
+
+**Estudos: salvar, novo e abrir**
+
+Toda rodada concluída fica gravada no banco local (`.local/forecast.duckdb`) com um **ID**
+(8 primeiros caracteres mostrados na tela) e a **data/hora em que rodou**. "Salvar" é dar um
+**nome** ao estudo para reabri-lo depois.
+
+- **Salvar estudo:** ao terminar a rodada abre uma janela pedindo o nome (já vem sugerido:
+  arquivo + data). **Enter** ou **Salvar** grava; **Agora não** deixa o estudo sem nome. Depois,
+  o botão **Salvar estudo** / **Renomear estudo** no cartão da barra lateral reabre a janela.
+- **Novo estudo:** limpa a tela (arquivo, árvore, gráfico, métodos, horizonte) para uma nova
+  projeção. Se o estudo atual não tem nome, a tela avisa antes de sair. Os estudos anteriores
+  continuam no banco.
+- **Abrir estudo:** lista os estudos já rodados (nome, arquivo, data/hora, horizonte, nº de
+  séries, nº de métodos e ID); clique numa linha para abrir. **Rodadas sem nome ficam ocultas por
+  padrão**: marque **Mostrar rodadas sem nome** (a lista informa quantas estão ocultas; a
+  escolha fica lembrada no navegador) para vê-las como "Sem nome". Abrir um estudo restaura árvore, gráficos, cards e **Exportar Excel**; o
+  arquivo e a preparação ficam associados, então **Gerar** roda uma nova projeção
+  (novo estudo, com novo ID) a partir dos mesmos dados.
+- **Excluir:** o botão **Excluir** de cada linha abre uma confirmação ("Excluir definitivamente").
+  Apaga do banco local as projeções, o backtest e as métricas daquele estudo; **não** apaga o
+  arquivo importado nem outros estudos. **Não há como desfazer.** Se o estudo excluído for o que
+  está aberto, a tela volta ao estado inicial.
+- A lista mostra apenas rodadas concluídas.
+
+**Cards da direita**
+
+| Card | O que significa |
+|------|-----------------|
+| **Último MAT** | Soma dos últimos 12 meses **observados** (histórico, sem projeção). Precisa de 12 meses |
+| **Variação MAT (YoY)** | Último MAT comparado ao MAT de 12 meses antes. Precisa de 24 meses |
+| **CAGR do MAT** | Crescimento médio composto **ao ano** entre o primeiro e o último bloco de 12 meses do histórico. Só aparece com 36 meses ou mais (ex.: 60 meses = 5 MATs = 4 anos de crescimento) |
+| **Total projetado no horizonte** | Soma da projeção de **todos os meses do horizonte** (ex.: 12 meses), com o método de referência do item |
+| **Erro do método (WAPE)** | Erro do método nos **meses passados já conhecidos** (backtest: o método prevê esses meses e compara com o real): soma dos erros absolutos ÷ soma do real. Quanto menor, melhor; 20% = errou, em média, 20% do volume |
+| **Viés do método (Bias)** | Erro médio **com sinal** por mês no backtest (previsto − real), em unidades. Positivo = tende a superestimar; negativo = subestimar; perto de 0 = sem tendência |
+| **Máxima / Mínima** | Maior e menor valor mensal do histórico, com o mês em que ocorreram |
+| **Desvio padrão** | Dispersão dos valores mensais em torno da média (desvio padrão amostral) |
+| **Erro padrão da média** | Desvio padrão ÷ √n (n = meses do histórico): incerteza da média mensal |
+
+As estatísticas (máxima, mínima, desvio e erro padrão) são calculadas sobre o histórico
+observado do item, não sobre a projeção. Passar o mouse sobre um card mostra a mesma explicação.
+
+**Abas do gráfico**
+
+- **Projeção do item:** histórico, projeção do método de referência do item e faixa de
+  intervalo de 80% quando disponível. Se você rodou vários métodos, o método de
+  referência é o de **menor WAPE** entre eles; os demais aparecem em "alternativas".
+- **Comparar métodos:** uma curva por método rodado no item ativo, com o WAPE de cada um na legenda.
+- **Comparar itens:** uma linha por item marcado na árvore, todos com o **mesmo método**
+  escolhido na aba. Histórico em linha sólida e projeção tracejada.
+
+Nas abas de comparação, passe o mouse para ver os valores e clique na legenda para ocultar/exibir uma curva.
+
+**Exportar Excel**
+
+O botão **Exportar Excel** (habilita quando a rodada termina) baixa
+`forecast_<run_id>.xlsx` no formato da base de origem, só com as séries mais detalhadas (folhas):
+
+| Aba | Conteúdo |
+|-----|----------|
+| `Historico` | Colunas de dimensão + uma coluna por período do histórico (`YYYYMM`) |
+| Uma aba por método rodado | Colunas de dimensão + uma coluna por período projetado |
+| `Metadados` | Configuração da rodada e versões das dependências |
+
+Valores projetados são exportados como calculados (sem intervalos nem arredondamento). Ajustes
+manuais dos números são feitos no Excel — a tela não edita valores. Se quiser outro método
+ou outro horizonte, rode de novo.
+
+**Limites da tela única**
+
+- Só reconhece arquivos no formato largo com colunas de período. Se o arquivo não for
+  reconhecido, a tela avisa que o mapeamento manual ainda não está disponível; use o Laboratório.
+- Não há cenários, regressoras, hierarquia MinT, congelamento de rodada nem lista de
+  exceções na tela; esses recursos ficam no Laboratório (cenários, regressoras, MinT) ou fora do escopo.
 
 ### Sobre sessões e reinício
 
@@ -127,7 +258,10 @@ A aplicação abre automaticamente no navegador em `http://localhost:8501`.
 
 ## 4. Jornada passo a passo
 
-O Forecast Community é um **assistente linear (wizard)** de 5 etapas: **Arquivo →
+> Esta seção descreve o **Laboratório (Streamlit)**. Para o caminho rápido, veja a
+> [seção 3.1](#31-tela-única-uso-rápido).
+
+O Laboratório é um **assistente linear (wizard)** de 5 etapas: **Arquivo →
 Mapeamento → Qualidade → Previsão → Resultados**. Uma barra de progresso no topo
 mostra a etapa atual, e o rodapé traz os botões **← Voltar** e **Avançar →** — este
 último só é habilitado quando a etapa corrente está completa (se estiver
@@ -982,6 +1116,10 @@ negócio.
 
 ## 13. Exportação de resultados
 
+**Tela única:** o botão **Exportar Excel** gera o XLSX simples de [seção 3.1](#31-tela-única-uso-rápido)
+(`Historico` + uma aba por método + `Metadados`, só folhas). O restante desta seção
+descreve a exportação completa do **Laboratório**.
+
 ### Opções de configuração
 
 | Parâmetro | Opções |
@@ -1103,7 +1241,8 @@ pip list | findstr lightgbm
 pip list | findstr xgboost
 ```
 
-Se ausente: `pip install -r requirements.txt`. Lembre também de marcar o checkbox
+Se ausente: `pip install -r requirements-ml.txt` (o complemento ML não vem no
+`requirements.txt`). No Laboratório, lembre também de marcar o checkbox
 **"Habilitar aprendizado global"** na Etapa 4 — e lembre que o modelo global exige
 **≥ 20 entidades** e **≥ 200 linhas treináveis** na medida; sem isso, ele não entra no
 catálogo mesmo instalado.
@@ -1136,9 +1275,13 @@ Duas regras da **mesma família** com a **mesma prioridade** se sobrepõem na me
   `n_jobs=1`), somente `AutoARIMA`: **1 fold ≈ 30s**, 2 folds ≈ 64s, 3 folds ≈ 88s —
   sem ganho monotônico de MAE/WAPE nessa amostra. Rodadas exploratórias podem usar
   1 fold e deixar 2–3 folds para a rodada final.
-- A rodada **não grava nada no banco até o fim**: o progresso aparece no log da Etapa 4
-  ("X de N séries"), mas os resultados só são persistidos na conclusão. Se o tempo
-  estimado passar de alguns minutos, reduza métodos e/ou folds antes de executar.
+- No **Laboratório**, a rodada não grava nada no banco até o fim: o progresso aparece no
+  log da Etapa 4 ("X de N séries"), mas os resultados só são persistidos na conclusão. Se
+  o tempo estimado passar de alguns minutos, reduza métodos e/ou folds antes de executar.
+  Na **tela única**, o resultado é gravado por lote durante a rodada.
+- Na **tela única**, métodos caros (`AutoARIMA`, `AutoTBATS`, `LightGBM`, `XGBoost`) são
+  executados um após o outro e o tempo total é a **soma** deles; em 500+ séries isso pode
+  levar vários minutos. Comece pelo núcleo e acrescente os lentos só se precisar.
 
 ---
 

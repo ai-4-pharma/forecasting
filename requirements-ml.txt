@@ -1,0 +1,20 @@
+# Forecast Community - complemento opcional de aprendizado global (S1.6)
+# Instale POR CIMA de requirements.txt para habilitar os candidatos
+# "LightGBM"/"XGBoost" (checkbox "Habilitar aprendizado global"). Sem este
+# complemento, `_ml_available()` retorna falso e o produto funciona normalmente
+# so com o motor estatistico (StatsForecast).
+#
+# Uso:
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#   .venv\Scripts\python.exe -m pip install -r requirements-ml.txt
+
+mlforecast==1.1.0
+lightgbm==4.7.0
+xgboost==2.1.4
+
+# Dependencias transitivas relevantes (instaladas automaticamente, sem pin
+# proprio): scikit-learn e optuna (via mlforecast).
+#
+# Opcional de desempenho: `numba` acelera os loops do utilsforecast usados no
+# caminho ML. Sem ele o pacote avisa que "algumas operacoes podem ficar lentas",
+# mas a aplicacao funciona -- por isso nao e obrigatorio aqui.

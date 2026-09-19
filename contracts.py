@@ -164,7 +164,7 @@ MAX_HISTORY_YEARS = 5
 MAX_HORIZON_MAT = 120
 MAX_HISTORY_MAT = 60
 
-DEFAULT_CV_WINDOWS = 3
+DEFAULT_CV_WINDOWS = 1
 DEFAULT_BATCH_SIZE = 250
 MAX_BATCH_SIZE = 500
 DEFAULT_N_JOBS = 1
@@ -172,6 +172,26 @@ MAX_N_JOBS = 4
 DEFAULT_INTERVAL_LEVEL = 80
 DEFAULT_SEED = 42
 MAX_REGRESSORS_PER_RUN = 5
+
+# S1.6: núcleo do produto (tela única) vs. modo avançado/laboratório. O núcleo
+# cobre o baseline automático (S1.7) sem exigir o complemento de ML.
+CORE_ALIASES = ("Naive", "SeasonalNaive", "AutoETS", "AutoTheta", "CrostonSBA", "TSB")
+ADVANCED_ALIASES = (
+    "MediaMovel3",
+    "MediaMovel6",
+    "MediaMovel12",
+    "HistoricAverage",
+    "RegLinearDrift",
+    "Holt",
+    "HoltDamped",
+    "AutoCES",
+    "AutoARIMA",
+    "AutoTBATS",
+    "ETS_Damped",
+    "AutoARIMA_X",
+    "LightGBM",
+    "XGBoost",
+)
 
 INTERMITTENT_ADI_THRESHOLD = 1.32
 INTERMITTENT_CV2_THRESHOLD = 0.49
@@ -631,7 +651,7 @@ class HierarchyConfig:
 @dataclass
 class ForecastConfig:
     schema_version: int = SCHEMA_VERSION
-    horizon_periods: int = 24
+    horizon_periods: int = 12
     mode: ForecastMode = ForecastMode.FAST
     candidate_aliases: list[str] = field(default_factory=list)
     enable_ml: bool = False
@@ -665,6 +685,8 @@ class ForecastConfig:
             errs.append(f"n_jobs deve estar entre 1 e {MAX_N_JOBS}.")
         if self.cv_horizon is not None and self.cv_horizon < 1:
             errs.append("cv_horizon deve ser positivo.")
+        if len(self.candidate_aliases) > 5:
+            errs.append("Selecione no máximo 5 métodos para comparar.")
         return errs
 
     def to_json(self) -> str:
@@ -699,7 +721,7 @@ class ForecastConfig:
             candidate_aliases=list(d.get("candidate_aliases", [])),
             enable_ml=bool(d.get("enable_ml", False)),
             cv_horizon=d.get("cv_horizon"),
-            cv_windows=int(d.get("cv_windows", DEFAULT_CV_WINDOWS)),
+            cv_windows=int(d.get("cv_windows", 3)),
             batch_size=int(d.get("batch_size", DEFAULT_BATCH_SIZE)),
             n_jobs=int(d.get("n_jobs", DEFAULT_N_JOBS)),
             nonnegative_output=bool(d.get("nonnegative_output", True)),

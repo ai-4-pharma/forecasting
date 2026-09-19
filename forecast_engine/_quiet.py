@@ -16,6 +16,11 @@ Este modulo concentra o silenciamento em dois niveis:
   (esse ambiente e lido pelo interpretador no startup do filho);
 * `quiet_native()` — context manager usado nos pontos de ajuste/previsao.
 
+Alem do aviso de convergencia, o scipy dispara `RuntimeWarning` de ponto
+flutuante ("invalid value encountered...", "overflow encountered...") durante a
+otimizacao do ARIMA. Como o numpy/scipy atribuem o warning ao arquivo chamador
+(nao ao numpy), o filtro precisa citar `scipy.`/`numpy.` explicitamente.
+
 O escopo e restrito as bibliotecas numericas de terceiros: warnings do proprio
 projeto (contracts, data_engine, forecast_engine, app_ui) continuam aparecendo.
 """
@@ -27,7 +32,8 @@ import os
 import warnings
 
 _NOISY_MODULE_RE = (
-    r"(statsforecast|utilsforecast|mlforecast|lightgbm|xgboost|sklearn|numba)\."
+    r"(statsforecast|utilsforecast|mlforecast|lightgbm|xgboost|sklearn"
+    r"|scipy|numpy|numba)\."
 )
 
 _NOISY_CATEGORIES = (
