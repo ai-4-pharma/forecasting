@@ -20,6 +20,8 @@ plotly==5.24.1
 fastapi>=0.118
 uvicorn[standard]>=0.34
 python-multipart>=0.0.20
+httpx>=0.27  # chamada ao OpenRouter (assistente de chat)
+truststore>=0.9  # HTTPS via repositorio de certificados do SO (antivirus/proxy que interceptam TLS)
 
 # --- Interoperabilidade (exigidas por streamlit / polars.to_pandas) -------
 pandas==2.3.3

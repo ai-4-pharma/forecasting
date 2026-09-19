@@ -15,6 +15,70 @@
 // nunca falhou. Por isso o chart vive numa variável de módulo comum.
 let _chart = null;
 
+// Markdown mínimo e seguro para as respostas do assistente: escapa o HTML antes
+// de qualquer transformação (negrito, itálico, código, listas, títulos, tabelas).
+function renderChatMarkdown(text) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const inline = (s) =>
+    esc(s)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  const isRow = (l) => /^\s*\|.*\|\s*$/.test(l);
+  const isSep = (l) => /^[\s:|-]+$/.test(l) && l.includes("-");
+  const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+  const lines = String(text || "").split("\n");
+  const out = [];
+  let list = null;
+  const closeList = () => {
+    if (list) out.push(`</${list}>`);
+    list = null;
+  };
+  const openList = (kind) => {
+    if (list !== kind) {
+      closeList();
+      out.push(`<${kind}>`);
+      list = kind;
+    }
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (isRow(line)) {
+      closeList();
+      const rows = [];
+      while (i < lines.length && isRow(lines[i])) rows.push(lines[i++]);
+      const body = rows.filter((r) => !isSep(r));
+      let html = '<div class="chat-table-wrap"><table>';
+      body.forEach((r, k) => {
+        const tag = k === 0 && rows.length > 1 && isSep(rows[1]) ? "th" : "td";
+        html += "<tr>" + cells(r).map((c) => `<${tag}>${inline(c)}</${tag}>`).join("") + "</tr>";
+      });
+      out.push(html + "</table></div>");
+      continue;
+    }
+    if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) {
+      openList("ul");
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      openList("ol");
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^#{1,6}\s+(.*)$/))) {
+      closeList();
+      out.push(`<p><strong>${inline(m[1])}</strong></p>`);
+    } else if (!line.trim()) {
+      closeList();
+    } else {
+      closeList();
+      out.push(`<p>${inline(line)}</p>`);
+    }
+    i++;
+  }
+  closeList();
+  return out.join("");
+}
+
 function app() {
   return {
     datasetId: null,
@@ -56,6 +120,28 @@ function app() {
     deleteTarget: null,
     deleting: false,
     deleteError: "",
+    // Assistente (chat via OpenRouter): o backend guarda a chave; aqui só o estado da conversa.
+    chatOpen: false,
+    chatConfig: { configured: null, key_source: null, key_hint: null, models: [], default_model: "", pricing_source: "" }, // configured: null = ainda não consultado
+    chatKeyInput: "", // chave digitada na tela (vai só ao servidor local, que a guarda em memória)
+    chatKeyBusy: false,
+    chatKeyError: "",
+    chatModelsOpen: false, // lista de modelos (dropdown com preço e contexto)
+    chatCatalog: [], // catálogo completo do OpenRouter (datalist do "Outro modelo")
+    chatModel: localStorage.getItem("chatModel") || "",
+    chatCustom: false,
+    chatIncludeContext: localStorage.getItem("chatIncludeContext") !== "0",
+    chatAck: localStorage.getItem("chatAck") === "1", // ciência de que os dados da tela vão ao OpenRouter
+    chatMessages: [], // [{role, content, model?}]
+    chatInput: "",
+    chatSending: false,
+    chatError: "",
+    chatSuggestions: [
+      "Explique esta projeção em poucas linhas.",
+      "O que significam WAPE e Bias neste item?",
+      "Por que os métodos dão projeções diferentes?",
+      "Que cuidados devo ter ao usar este resultado?",
+    ],
     progressLog: [], // últimas mensagens de progresso da rodada (S2.9), mais recente por último
     progressCompleted: 0,
     progressTotal: 0,
@@ -401,6 +487,8 @@ function app() {
       this.progressCompleted = 0;
       this.progressTotal = 0;
       this.dialog = null;
+      this.chatMessages = [];
+      this.chatError = "";
       this._resetChart();
       if (this.grid) {
         this.grid.setGridOption("rowData", []);
@@ -491,6 +579,284 @@ function app() {
       if (!iso) return "—";
       const d = new Date(iso);
       return d.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+    },
+
+    // ---- Assistente (chat) -------------------------------------------------
+    async toggleChat() {
+      this.chatOpen = !this.chatOpen;
+      if (!this.chatOpen) return;
+      if (this.chatConfig.configured !== true) await this.loadChatConfig();
+      this.$nextTick(() => {
+        this._chatScroll();
+        this.$refs.chatInput && this.$refs.chatInput.focus();
+      });
+    },
+
+    async loadChatConfig() {
+      try {
+        const resp = await fetch("/chat/config");
+        const body = await resp.json();
+        this.chatConfig = body;
+        const ids = (body.models || []).map((m) => m.id);
+        if (!this.chatModel) this.chatModel = body.default_model;
+        this.chatCustom = !ids.includes(this.chatModel);
+        if (this.chatCustom) this.loadChatCatalog();
+      } catch (e) {
+        this.chatError = "Não foi possível consultar a configuração do chat.";
+      }
+    },
+
+    async loadChatCatalog() {
+      if (this.chatCatalog.length) return;
+      try {
+        const resp = await fetch("/chat/models");
+        const body = await resp.json();
+        this.chatCatalog = body.models || [];
+      } catch (e) {
+        /* catálogo é opcional: sem ele só os favoritos e o campo livre */
+      }
+    },
+
+    pickChatModel(m) {
+      if (!m.available) return;
+      this.chatCustom = false;
+      this.setChatModel(m.id);
+      this.chatModelsOpen = false;
+    },
+
+    pickCustomChatModel() {
+      this.chatCustom = true;
+      this.loadChatCatalog();
+      this.setChatModel("");
+      this.chatModelsOpen = false;
+      this.$nextTick(() => this.$refs.chatCustomInput && this.$refs.chatCustomInput.focus());
+    },
+
+    chatModelSummary() {
+      if (this.chatCustom) return this.chatModel ? `Outro: ${this.chatModel}` : "Outro modelo…";
+      const m = this.chatConfig.models.find((x) => x.id === this.chatModel);
+      if (!m) return this.chatModel || "Escolha um modelo";
+      return m.input == null ? m.label : `${m.label} · US$ ${this.fmtUsd(m.input)} / ${this.fmtUsd(m.output)}`;
+    },
+
+    chatPricingNote() {
+      const src = this.chatConfig.pricing_source === "live"
+        ? "Preços do catálogo do OpenRouter (podem variar por provedor)."
+        : "Sem acesso ao catálogo agora: valores de 19/09/2026.";
+      return `USD por 1 milhão de tokens. ${src}`;
+    },
+
+    fmtUsd(v) {
+      if (v == null) return "—";
+      return v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: v < 0.1 ? 3 : 2 });
+    },
+
+    fmtCtx(v) {
+      if (v == null) return "—";
+      if (v >= 1e6) return `${(v / 1e6).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}M`;
+      return `${Math.round(v / 1000)}k`;
+    },
+
+    async activateChatKey() {
+      const key = this.chatKeyInput.trim();
+      if (!key || this.chatKeyBusy) return;
+      this.chatKeyBusy = true;
+      this.chatKeyError = "";
+      try {
+        const resp = await fetch("/chat/key", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: key }),
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          this.chatKeyError = typeof body.detail === "string" ? body.detail : "Não foi possível guardar a chave.";
+          return;
+        }
+        this.chatKeyInput = "";
+        await this.loadChatConfig();
+        if (body.verified === false) {
+          this.chatError = "Chave guardada, mas não foi possível validá-la agora (sem conexão com o OpenRouter?).";
+        }
+      } catch (e) {
+        this.chatKeyError = "Não foi possível conectar à API local.";
+      } finally {
+        this.chatKeyBusy = false;
+      }
+    },
+
+    async forgetChatKey() {
+      try {
+        await fetch("/chat/key", { method: "DELETE" });
+      } catch (e) {
+        /* falha de rede local: o estado abaixo é reconsultado de qualquer forma */
+      }
+      this.chatError = "";
+      await this.loadChatConfig();
+    },
+
+    setChatModel(v) {
+      this.chatModel = (v || "").trim();
+      try { localStorage.setItem("chatModel", this.chatModel); } catch (e) { /* sem storage */ }
+    },
+
+    ackChat() {
+      this.chatAck = true;
+      try { localStorage.setItem("chatAck", "1"); } catch (e) { /* sem storage */ }
+    },
+
+    saveChatPrefs() {
+      try { localStorage.setItem("chatIncludeContext", this.chatIncludeContext ? "1" : "0"); } catch (e) { /* sem storage */ }
+    },
+
+    clearChat() {
+      this.chatMessages = [];
+      this.chatError = "";
+    },
+
+    chatHtml(text) {
+      return renderChatMarkdown(text);
+    },
+
+    _chatScroll() {
+      this.$nextTick(() => {
+        const el = this.$refs.chatScroll;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+
+    async sendChat(text) {
+      const content = (text !== undefined ? text : this.chatInput).trim();
+      if (!content || this.chatSending) return;
+      if (!this.chatModel) {
+        this.chatError = "Escolha um modelo.";
+        return;
+      }
+      this.chatError = "";
+      this.chatMessages.push({ role: "user", content });
+      this.chatInput = "";
+      this.chatSending = true;
+      this._chatScroll();
+      try {
+        const resp = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: this.chatMessages.map((m) => ({ role: m.role, content: m.content })),
+            model: this.chatModel,
+            context: this.chatIncludeContext ? this.chatContext() : null,
+          }),
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          this.chatError = typeof body.detail === "string" ? body.detail : "Não foi possível obter a resposta.";
+          // devolve a pergunta ao campo para tentar de novo (ex.: outro modelo)
+          this.chatMessages.pop();
+          this.chatInput = content;
+          if (resp.status === 400) this.chatConfig.configured = false;
+          return;
+        }
+        this.chatMessages.push({ role: "assistant", content: body.reply, model: body.model });
+      } catch (e) {
+        this.chatError = "Não foi possível conectar à API local.";
+        this.chatMessages.pop();
+        this.chatInput = content;
+      } finally {
+        this.chatSending = false;
+        this._chatScroll();
+      }
+    },
+
+    // O que o usuário está vendo agora, em JSON compacto para o assistente:
+    // estudo, item em foco, cards, histórico recente, projeção e, conforme a
+    // aba ativa, a comparação de métodos ou de itens. Números arredondados.
+    chatContext() {
+      const r1 = (v) => (v == null || Number.isNaN(v) ? null : Math.round(v * 10) / 10);
+      const pct = (v) => (v == null ? null : Math.round(v * 1000) / 10);
+      const ym = (d) => String(d).slice(0, 7);
+      const fc = (rows) => (rows || []).map((b) => [ym(b.ds), r1(b.yhat)]);
+      const ctx = {
+        estudo: this.currentStudy
+          ? {
+              nome: this.currentStudy.saved ? this.currentStudy.name : null,
+              id: this.currentStudy.short_id,
+              rodou_em: this.currentStudy.started_at,
+              arquivo: this.currentStudy.filename,
+              horizonte_meses: this.currentStudy.horizon || this.horizon,
+              metodos_rodados: this.currentStudy.models || [],
+              metodo_automatico: !this.selectedModels.length,
+            }
+          : null,
+        arquivo: { rotulo: this.datasetLabel, qualidade: this.qualitySummary || null },
+        aba_ativa: ["Projeção do item", "Comparar métodos", "Comparar itens"][this.activeTab - 1],
+        filtros_marcados: this.selectedItems.map((n) => `${n.dim} = ${n.name}`),
+        item_em_foco: this.selected
+          ? {
+              nivel: this.selected.dim,
+              valor: this.selected.value,
+              series_detalhadas_somadas: this.series ? this.series.n_series : null,
+              medida: this.series ? this.series.measure : null,
+            }
+          : null,
+      };
+      const s = this.series;
+      if (s) {
+        const k = s.kpis || {};
+        const st = k.stats;
+        ctx.cards = {
+          ultimo_mat: r1(k.mat),
+          variacao_mat_yoy_pct: pct(k.yoy),
+          cagr_mat_pct: pct(k.cagr),
+          cagr_anos: k.cagr_years,
+          meses_de_historico: k.hist_months,
+          total_projetado_no_horizonte: r1(k.total_h),
+          meses_projetados: k.horizon_n,
+          wape_backtest_pct: pct(k.wape),
+          bias_backtest: r1(k.bias),
+          estatisticas_do_historico: st
+            ? {
+                maxima: r1(st.max), mes_da_maxima: ym(st.max_ds),
+                minima: r1(st.min), mes_da_minima: ym(st.min_ds),
+                desvio_padrao: r1(st.std), erro_padrao_da_media: r1(st.sem),
+              }
+            : null,
+        };
+        ctx.metodos_melhores_no_backtest = (s.alternatives || []).map((a) => ({
+          metodo: a.alias,
+          wape_pct: pct(a.wape),
+        }));
+        ctx.historico_mensal_ultimos_36 = (s.history || []).slice(-36).map((h) => [ym(h.ds), r1(h.y)]);
+        ctx.projecao_mensal = {
+          colunas: ["mes", "previsto", "faixa80_min", "faixa80_max"],
+          linhas: (s.baseline || []).map((b) => [ym(b.ds), r1(b.yhat), r1(b.lo80), r1(b.hi80)]),
+          observacao:
+            "É a coluna Baseline do grid (a coluna Final é igual: não há ajustes manuais). " +
+            "Com método automático, cada série detalhada usa o seu melhor método.",
+        };
+      }
+      if (this.activeTab === 2 && this.compareData && this.compareData.models) {
+        ctx.comparacao_de_metodos = this.compareData.models.map((m) => ({
+          metodo: m.alias,
+          wape_backtest_pct: pct(m.wape),
+          projecao: fc(m.baseline),
+        }));
+      }
+      if (this.activeTab === 3 && this.multiSeries.length) {
+        ctx.comparacao_de_itens = {
+          metodo_aplicado_a_todos: this.multiModel,
+          itens: this.multiSeries.map((it) => {
+            const k = (it.data && it.data.kpis) || {};
+            return {
+              item: it.label,
+              ultimo_mat: r1(k.mat),
+              total_projetado_no_horizonte: r1(k.total_h),
+              wape_backtest_pct: pct(k.wape),
+              projecao: fc(it.data && it.data.baseline),
+            };
+          }),
+        };
+      }
+      return ctx;
     },
 
     progressPct() {

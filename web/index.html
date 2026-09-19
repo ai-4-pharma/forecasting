@@ -346,6 +346,132 @@
       </div>
     </div>
 
+    <!-- Assistente: chat sobre a projeção em tela (OpenRouter) -->
+    <button type="button" class="chat-fab" x-show="!chatOpen" @click="toggleChat()"
+      title="Conversar com o assistente sobre o que está na tela">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+      </svg>
+      Assistente
+    </button>
+
+    <section class="chat-panel" x-show="chatOpen" style="display:none" aria-label="Assistente">
+      <header class="chat-head">
+        <div class="chat-head-title">
+          <strong>Assistente</strong>
+          <small class="chat-key-hint" x-show="chatConfig.key_hint"
+            x-text="`chave ${chatConfig.key_hint} (${chatConfig.key_source === 'runtime' ? 'digitada na tela' : '.env'})`"></small>
+        </div>
+        <div class="chat-head-actions">
+          <button type="button" class="chat-icon-btn" x-show="chatConfig.key_source === 'runtime'"
+            @click="forgetChatKey()" title="Esquecer a chave digitada nesta sessão">Esquecer chave</button>
+          <button type="button" class="chat-icon-btn" @click="clearChat()" :disabled="!chatMessages.length"
+            title="Apagar a conversa">Limpar</button>
+          <button type="button" class="chat-icon-btn" @click="chatOpen = false" title="Fechar">&#10005;</button>
+        </div>
+      </header>
+
+      <div class="chat-model-row" x-show="chatConfig.configured" @click.outside="chatModelsOpen = false">
+        <button type="button" class="chat-model-btn" @click="chatModelsOpen = !chatModelsOpen"
+          title="Escolher o modelo (via OpenRouter)">
+          <span class="chat-model-btn-name" x-text="chatModelSummary()"></span>
+          <span class="chat-caret" aria-hidden="true">&#9662;</span>
+        </button>
+        <input x-show="chatCustom" x-ref="chatCustomInput" type="text" list="chat-catalog"
+          placeholder="ID do modelo, ex.: qwen/qwen3-max" :value="chatModel"
+          @change="setChatModel($event.target.value)">
+        <datalist id="chat-catalog">
+          <template x-for="id in chatCatalog" :key="id">
+            <option :value="id"></option>
+          </template>
+        </datalist>
+        <div class="chat-model-list" x-show="chatModelsOpen" style="display:none">
+          <div class="chat-model-head">
+            <span>Modelo</span><span class="cm-num">USD entrada</span><span class="cm-num">USD saída</span><span
+              class="cm-num">Contexto</span>
+          </div>
+          <template x-for="m in chatConfig.models" :key="m.id">
+            <button type="button" class="chat-model-item"
+              :class="{active: !chatCustom && chatModel === m.id, unavailable: !m.available}"
+              :disabled="!m.available" @click="pickChatModel(m)"
+              :title="m.available ? m.id : m.id + ' — não encontrado no catálogo do OpenRouter'">
+              <span class="cm-name" x-text="m.label"></span>
+              <span class="cm-num" x-text="m.available ? fmtUsd(m.input) : 'indisp.'"></span>
+              <span class="cm-num" x-text="m.available ? fmtUsd(m.output) : ''"></span>
+              <span class="cm-num" x-text="m.available ? fmtCtx(m.context) : ''"></span>
+            </button>
+          </template>
+          <button type="button" class="chat-model-item" :class="{active: chatCustom}" @click="pickCustomChatModel()">
+            <span class="cm-name">Outro modelo…</span><span class="cm-num"></span><span class="cm-num"></span><span
+              class="cm-num"></span>
+          </button>
+          <div class="chat-model-note" x-text="chatPricingNote()"></div>
+        </div>
+      </div>
+
+      <div class="chat-setup" x-show="chatConfig.configured === false">
+        <p><strong>Ative o assistente com a sua chave do OpenRouter.</strong> Crie uma em
+          <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>.</p>
+        <p class="chat-setup-title">Opção 1 — cole a chave aqui</p>
+        <div class="chat-key-row">
+          <input type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-…" x-model="chatKeyInput"
+            @keydown.enter="activateChatKey()" :disabled="chatKeyBusy">
+          <button type="button" @click="activateChatKey()" :disabled="chatKeyBusy || !chatKeyInput.trim()">Ativar</button>
+        </div>
+        <div class="chat-error" x-show="chatKeyError" x-text="chatKeyError"></div>
+        <p class="chat-setup-note">Fica só na memória do servidor enquanto a aplicação estiver aberta: vale para
+          todas as conversas e rodadas e é esquecida ao fechar a aplicação.</p>
+        <p class="chat-setup-title">Opção 2 — arquivo <code>.env</code> (permanente)</p>
+        <ol>
+          <li>Copie <code>.env.example</code> para <code>.env</code> na pasta do projeto.</li>
+          <li>Preencha <code>OPENROUTER_API_KEY=</code> com a sua chave.</li>
+          <li>Salve o arquivo e clique em verificar: não precisa reiniciar.</li>
+        </ol>
+        <button type="button" class="secondary" @click="loadChatConfig()">Verificar de novo</button>
+      </div>
+
+      <div class="chat-notice" x-show="chatConfig.configured && !chatAck">
+        <p>Para responder, o assistente recebe as suas mensagens <strong>e os dados que estão na tela</strong>
+          (séries, projeções e indicadores do item em foco). Eles são enviados ao OpenRouter e ao modelo
+          escolhido. O restante dos seus dados continua só no seu computador.</p>
+        <button type="button" @click="ackChat()">Entendi</button>
+      </div>
+
+      <div class="chat-body" x-ref="chatScroll" x-show="chatConfig.configured && chatAck">
+        <div class="chat-empty" x-show="!chatMessages.length">
+          <p>Pergunte sobre o que você está vendo: o assistente enxerga o item, os cards, a projeção e a aba
+            ativa.</p>
+          <template x-for="q in chatSuggestions" :key="q">
+            <button type="button" class="chat-chip" @click="sendChat(q)" x-text="q"></button>
+          </template>
+        </div>
+        <template x-for="(m, i) in chatMessages" :key="i">
+          <div class="chat-msg" :class="m.role">
+            <div class="chat-bubble" x-html="chatHtml(m.content)"></div>
+            <div class="chat-meta" x-show="m.model" x-text="m.model"></div>
+          </div>
+        </template>
+        <div class="chat-msg assistant" x-show="chatSending">
+          <div class="chat-bubble chat-typing">Pensando…</div>
+        </div>
+      </div>
+
+      <footer class="chat-foot" x-show="chatConfig.configured && chatAck">
+        <div class="chat-error" x-show="chatError" x-text="chatError"></div>
+        <label class="chat-ctx">
+          <input type="checkbox" x-model="chatIncludeContext" @change="saveChatPrefs()">
+          Enviar os dados da tela ao assistente
+        </label>
+        <div class="chat-input-row">
+          <textarea x-ref="chatInput" rows="2" placeholder="Pergunte sobre a projeção…" x-model="chatInput"
+            @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendChat(); }"
+            :disabled="chatSending"></textarea>
+          <button type="button" @click="sendChat()" :disabled="chatSending || !chatInput.trim()">Enviar</button>
+        </div>
+      </footer>
+    </section>
+
     <div class="error-banner" x-show="errorMessage" x-text="errorMessage"></div>
   </div>
 

@@ -58,7 +58,7 @@ O **Forecast Community** é uma ferramenta **local** de previsão de demanda des
 
 - Previsão diária ou semanal
 - Modelos neurais ou redes profundas
-- Acesso à internet, APIs comerciais ou serviços na nuvem
+- Acesso à internet, APIs comerciais ou serviços na nuvem (exceto o Assistente opcional, que usa o OpenRouter)
 - Colaboração simultânea de múltiplos usuários no mesmo banco
 - Ajuste automático de preços ou inferência de regras regulatórias
 
@@ -246,6 +246,35 @@ ou outro horizonte, rode de novo.
   reconhecido, a tela avisa que o mapeamento manual ainda não está disponível; use o Laboratório.
 - Não há cenários, regressoras, hierarquia MinT, congelamento de rodada nem lista de
   exceções na tela; esses recursos ficam no Laboratório (cenários, regressoras, MinT) ou fora do escopo.
+
+**Assistente (chat com IA, opcional)**
+
+O botão **Assistente**, no canto inferior direito, abre um chat que enxerga o que está na tela
+(estudo, item em foco, cards, histórico recente, projeção e, conforme a aba, a comparação de
+métodos ou de itens) e ajuda a entender e explicar a projeção: significado de WAPE/Bias/MAT,
+diferença entre métodos, limites da previsão. Ele só usa os números da tela.
+
+- **Chave do OpenRouter — duas formas:** (1) arquivo `.env` (copie `.env.example`, preencha
+  `OPENROUTER_API_KEY` antes de rodar; permanente); ou (2) cole a chave no painel do Assistente e
+  clique em **Ativar** (o OpenRouter confere a chave sem gastar créditos). A chave digitada fica
+  na **memória do servidor enquanto a aplicação estiver rodando** (vale para todas as conversas e
+  rodadas, mesmo recarregando a página) e some ao fechar a aplicação; **Esquecer chave** a remove
+  antes. Se houver as duas, vale a digitada na tela.
+- **Modelo:** o seletor mostra **USD de entrada, USD de saída (por 1 milhão de tokens) e contexto**
+  de cada modelo, lidos do catálogo do OpenRouter ao abrir o painel (sem acesso ao catálogo, usa
+  os valores de 19/09/2026). A lista traz Claude Opus 5 e 4.8, Kimi K3, GPT-5.6 Sol, GPT-6 Astra,
+  GPT-4o mini (padrão), Qwen3.8 Max, DeepSeek V4 Flash e Pro, GLM 5.3, Grok 4.6 e Gemini 3.1 Flash
+  Lite; **Outro modelo…** aceita qualquer ID do catálogo. Um modelo que saia do catálogo aparece
+  esmaecido como "indisp.". Variáveis opcionais no `.env`: `OPENROUTER_MODELS` (IDs separados por
+  vírgula), `OPENROUTER_DEFAULT_MODEL`, `OPENROUTER_MAX_TOKENS`, `OPENROUTER_TIMEOUT`.
+- **Privacidade e custo:** cada mensagem envia ao OpenRouter e ao modelo a conversa e (se a caixa
+  **Enviar os dados da tela ao assistente** estiver marcada) os dados exibidos; consome créditos
+  do seu OpenRouter. Desmarcando a caixa, nenhum número sai do computador.
+- **Erros:** chave inválida, créditos insuficientes, limite de requisições, ID de modelo
+  inexistente, falta de internet e problema de certificado HTTPS aparecem em português no
+  painel; a pergunta volta ao campo para você tentar de novo (por exemplo, com outro modelo).
+- O assistente **explica**, não altera a tela nem os números; e a projeção continua sendo
+  estatística (não conhece promoções, rupturas ou lançamentos).
 
 ### Sobre sessões e reinício
 

@@ -32,6 +32,7 @@ dev/
 # Segredos (defensivo; nao devem existir neste projeto)
 .env
 .env.*
+!.env.example
 credentials.json
 *.key
 *.pem

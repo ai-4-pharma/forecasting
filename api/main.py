@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from .chat import router as chat_router
 from .datasets import router as datasets_router
 from .exports import router as exports_router
 from .models import router as models_router
@@ -26,6 +27,7 @@ app.include_router(results_router)
 app.include_router(exports_router)
 app.include_router(studies_router)
 app.include_router(models_router)
+app.include_router(chat_router)
 
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 if _WEB_DIR.is_dir():
